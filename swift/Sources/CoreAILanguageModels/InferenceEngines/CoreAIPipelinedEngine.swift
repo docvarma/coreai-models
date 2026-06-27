@@ -375,6 +375,20 @@ final class PipelineGate: Sendable {
     }
 }
 
+// MARK: - Extra Fixed-Shape States
+
+/// A model state beyond the KV cache pair — e.g. the SSM conv/recurrent states of
+/// hybrid-attention models such as Qwen3.6. Unlike the KV cache these are
+/// fixed-shape (they don't grow with context), so one owned buffer is bound to every
+/// encode and zeroed on reset to start a fresh sequence.
+private struct PipelinedExtraState {
+    let name: String
+    let buffer: MTLBuffer
+    let scalarType: NDArray.ScalarType
+    let shape: [Int]
+    let strides: [Int]
+}
+
 // MARK: - Engine Implementation
 
 private struct EngineImpl: ~Copyable {
@@ -410,6 +424,9 @@ private struct EngineImpl: ~Copyable {
     // KV cache — reuses CoreAIKVCache protocol from KVCache+CoreAI.swift
     var kvCache: any CoreAIKVCache
 
+    // Fixed-shape states beyond the KV pair (SSM conv/recurrent for hybrid models)
+    let extraStates: [PipelinedExtraState]
+
     // Logits — reuses GrowingLogitsBuffer from TensorStorage+CoreAI.swift
     var logits: GrowingLogitsBuffer
 
@@ -444,7 +461,8 @@ private struct EngineImpl: ~Copyable {
                 "Cannot find function '\(config.function)' in model")
         }
 
-        // Validate: 2 inputs, 1+ output, 2 states
+        // Validate: 2 inputs, 1+ output, 2+ states (KV cache pair, plus optional
+        // fixed-shape extras such as the SSM conv/recurrent states of hybrid models)
         guard descriptor.inputNames.count == 2 else {
             throw InferenceRuntimeError.invalidInputType(
                 "Expected 2 inputs, got \(descriptor.inputNames.count): \(descriptor.inputNames)")
@@ -453,9 +471,14 @@ private struct EngineImpl: ~Copyable {
             throw InferenceRuntimeError.invalidOutputType(
                 "Expected at least 1 output, got \(descriptor.outputNames.count)")
         }
-        guard descriptor.stateNames.count == 2 else {
+        guard descriptor.stateNames.count >= 2 else {
             throw InferenceRuntimeError.invalidOutputType(
-                "Expected 2 states (KV cache), got \(descriptor.stateNames.count): \(descriptor.stateNames)")
+                "Expected at least 2 states (KV cache), got \(descriptor.stateNames.count): \(descriptor.stateNames)")
+        }
+        guard descriptor.stateNames.count - 2 <= Self.maxExtraStates else {
+            throw InferenceRuntimeError.invalidOutputType(
+                "At most \(Self.maxExtraStates) extra states beyond the KV pair are supported, "
+                    + "got \(descriptor.stateNames.count - 2): \(descriptor.stateNames.dropFirst(2))")
         }
 
         // Extract names
@@ -464,6 +487,41 @@ private struct EngineImpl: ~Copyable {
         let keyCacheName = descriptor.stateNames[0]
         let valueCacheName = descriptor.stateNames[1]
         let logitsOutputName = descriptor.outputNames[0]
+
+        // States beyond the KV pair must be fixed-shape; allocate one owned
+        // zero-filled buffer each (they persist across steps, zeroed on reset).
+        var extraStatesLocal: [PipelinedExtraState] = []
+        for name in descriptor.stateNames.dropFirst(2) {
+            guard case .ndArray(let desc) = descriptor.stateDescriptor(of: name) else {
+                throw InferenceRuntimeError.invalidOutputType(
+                    "Cannot get descriptor for extra state '\(name)'")
+            }
+            guard !desc.shape.contains(where: { $0 < 0 }) else {
+                throw InferenceRuntimeError.invalidOutputType(
+                    "Extra state '\(name)' has dynamic dims \(desc.shape) — only the first two "
+                        + "states (KV cache) may be dynamic in the pipelined engine")
+            }
+            let resolved = desc.resolvingDynamicDimensions(desc.shape)
+            let byteCount = resolved.minimumByteCount
+            guard let buf = device.makeBuffer(length: byteCount, options: .storageModeShared) else {
+                throw InferenceRuntimeError.bufferAllocationFailed(
+                    "extra state '\(name)' (\(byteCount) bytes)")
+            }
+            memset(buf.contents(), 0, byteCount)
+            extraStatesLocal.append(
+                PipelinedExtraState(
+                    name: name,
+                    buffer: buf,
+                    scalarType: desc.scalarType,
+                    shape: desc.shape,
+                    strides: resolved.preferredStrides
+                ))
+        }
+        if !extraStatesLocal.isEmpty {
+            CLILogger.log(
+                "Pipelined engine carrying \(extraStatesLocal.count) fixed-shape extra state(s): "
+                    + extraStatesLocal.map(\.name).joined(separator: ", "))
+        }
 
         // Extract state descriptors for KV cache shape/type
         guard case .ndArray(let keyCacheDesc) = descriptor.stateDescriptor(of: keyCacheName),
@@ -547,14 +605,18 @@ private struct EngineImpl: ~Copyable {
         let resolvedSize = options.resolvedKVCacheSize(maxContextLength: config.maxContextLength)
         CLILogger.log("Created \(options.kvCacheStrategy) KV cache with size \(resolvedSize, default: "nil")")
 
-        // Create growing logits buffer (reuses TensorStorage+CoreAI.swift)
+        // Create growing logits buffer (reuses TensorStorage+CoreAI.swift).
+        // A fully static logits output (e.g. a decode-only S=1 graph: [1, 1, vocab])
+        // can't be resolved at a larger capacity — size the buffer to its static
+        // sequence length instead of the prompt-sized default.
+        let logitsSeqIsStatic = logitsDesc.shape.count >= 2 && logitsDesc.shape[1] > 0
         let logitsRef = try GrowingLogitsBuffer(
             device: device,
             descriptor: descriptor,
             name: logitsOutputName,
             vocabSize: config.vocabSize,
-            maxCapacity: config.maxContextLength,
-            initialCapacity: averageExpectedPromptSize
+            maxCapacity: logitsSeqIsStatic ? logitsDesc.shape[1] : config.maxContextLength,
+            initialCapacity: logitsSeqIsStatic ? logitsDesc.shape[1] : averageExpectedPromptSize
         )
 
         // Load inference function
@@ -592,11 +654,32 @@ private struct EngineImpl: ~Copyable {
         self.decodeOutputBuffers = decodeOutBuffers
         self.decodeLogitsBuffers = decodeLogBufs
         self.kvCache = kvCacheLocal
+        self.extraStates = extraStatesLocal
         self.logits = logitsRef
         self.cachedSampler = nil
         self.cachedSamplerTemperature = nil
 
         CLILogger.log("CoreAI pipelined engine initialized — Vocab: \(config.vocabSize)")
+    }
+
+    // MARK: - Extra State Binding
+
+    /// Maximum number of extra states beyond the KV pair. AsyncMutableViews'
+    /// lifetime is tied to each inserted value VARIABLE (`@_lifetime(self: &value)`),
+    /// so binding must be unrolled per arity with insert + encode in one scope —
+    /// see the `switch extraStates.count` at the encode sites.
+    static let maxExtraStates = 2
+
+    /// Build a bindable view over extra state `i` (caller guarantees `i < extraStates.count`).
+    private func extraStateValue(_ i: Int) -> InferenceFunction.AsyncMutableValue {
+        let extra = extraStates[i]
+        return unsafe InferenceFunction.AsyncMutableValue(
+            unsafeBuffer: extra.buffer,
+            byteOffset: 0,
+            scalarType: extra.scalarType,
+            shape: extra.shape,
+            strides: extra.strides
+        )
     }
 
     // MARK: - Sampler
@@ -767,14 +850,40 @@ private struct EngineImpl: ~Copyable {
 
         // Encode inference using the public encode() API.
         // This commits + uses runAfterSyncPoint (no stream wait) — enables true pipelining.
+        // Extra fixed-shape states (SSM conv/rec) are inserted in the same scope as the
+        // consuming encode call — the views' lifetime is tied to each inserted value
+        // variable, so insert and encode can't be separated by a scope boundary.
         let logitsSpan = InstrumentsProfiler.beginLogitsInference(
             step: currentStep, tokens: queryLength, engine: "CoreAI-Pipelined")
-        let _ = try function.encode(
-            inputs: asyncInputs,
-            states: consume asyncStates,
-            outputViews: consume asyncOutputs,
-            to: computeStream
-        )
+        switch extraStates.count {
+        case 0:
+            let _ = try function.encode(
+                inputs: asyncInputs,
+                states: consume asyncStates,
+                outputViews: consume asyncOutputs,
+                to: computeStream
+            )
+        case 1:
+            var extraValue0 = extraStateValue(0)
+            asyncStates.insert(&extraValue0, for: extraStates[0].name)
+            let _ = try function.encode(
+                inputs: asyncInputs,
+                states: consume asyncStates,
+                outputViews: consume asyncOutputs,
+                to: computeStream
+            )
+        default:  // 2 — init caps extra states at maxExtraStates
+            var extraValue0 = extraStateValue(0)
+            var extraValue1 = extraStateValue(1)
+            asyncStates.insert(&extraValue0, for: extraStates[0].name)
+            asyncStates.insert(&extraValue1, for: extraStates[1].name)
+            let _ = try function.encode(
+                inputs: asyncInputs,
+                states: consume asyncStates,
+                outputViews: consume asyncOutputs,
+                to: computeStream
+            )
+        }
         logitsSpan.end()
 
         // GPU sampling via Metal queue
@@ -1063,12 +1172,35 @@ private struct EngineImpl: ~Copyable {
         var asyncOutputs = InferenceFunction.AsyncMutableViews()
         asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
 
-        let _ = try function.encode(
-            inputs: asyncInputs,
-            states: consume asyncStates,
-            outputViews: consume asyncOutputs,
-            to: computeStream
-        )
+        switch extraStates.count {
+        case 0:
+            let _ = try function.encode(
+                inputs: asyncInputs,
+                states: consume asyncStates,
+                outputViews: consume asyncOutputs,
+                to: computeStream
+            )
+        case 1:
+            var extraValue0 = extraStateValue(0)
+            asyncStates.insert(&extraValue0, for: extraStates[0].name)
+            let _ = try function.encode(
+                inputs: asyncInputs,
+                states: consume asyncStates,
+                outputViews: consume asyncOutputs,
+                to: computeStream
+            )
+        default:  // 2 — init caps extra states at maxExtraStates
+            var extraValue0 = extraStateValue(0)
+            var extraValue1 = extraStateValue(1)
+            asyncStates.insert(&extraValue0, for: extraStates[0].name)
+            asyncStates.insert(&extraValue1, for: extraStates[1].name)
+            let _ = try function.encode(
+                inputs: asyncInputs,
+                states: consume asyncStates,
+                outputViews: consume asyncOutputs,
+                to: computeStream
+            )
+        }
 
         processedTokenCount += queryLength
         step += 1
@@ -1081,6 +1213,11 @@ private struct EngineImpl: ~Copyable {
         step = 0
         cachedSampler = nil
         cachedSamplerTemperature = nil
+        // Fresh sequence: SSM-style extra states must restart from zero. The KV pair
+        // needs no clearing — attention only reads positions below the new offset.
+        for extra in extraStates {
+            memset(extra.buffer.contents(), 0, extra.buffer.length)
+        }
         span.end()
     }
 
@@ -1167,12 +1304,35 @@ private struct EngineImpl: ~Copyable {
             var asyncOutputs = InferenceFunction.AsyncMutableViews()
             asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
 
-            let _ = try function.encode(
-                inputs: asyncInputs,
-                states: consume asyncStates,
-                outputViews: consume asyncOutputs,
-                to: computeStream
-            )
+            switch extraStates.count {
+            case 0:
+                let _ = try function.encode(
+                    inputs: asyncInputs,
+                    states: consume asyncStates,
+                    outputViews: consume asyncOutputs,
+                    to: computeStream
+                )
+            case 1:
+                var extraValue0 = extraStateValue(0)
+                asyncStates.insert(&extraValue0, for: extraStates[0].name)
+                let _ = try function.encode(
+                    inputs: asyncInputs,
+                    states: consume asyncStates,
+                    outputViews: consume asyncOutputs,
+                    to: computeStream
+                )
+            default:  // 2 — init caps extra states at maxExtraStates
+                var extraValue0 = extraStateValue(0)
+                var extraValue1 = extraStateValue(1)
+                asyncStates.insert(&extraValue0, for: extraStates[0].name)
+                asyncStates.insert(&extraValue1, for: extraStates[1].name)
+                let _ = try function.encode(
+                    inputs: asyncInputs,
+                    states: consume asyncStates,
+                    outputViews: consume asyncOutputs,
+                    to: computeStream
+                )
+            }
 
             // Warm up argmax kernel using pipeline-matched decode buffers
             let warmupLogitsBuffer = decodeLogitsBuffers[step % pipelineDepth]

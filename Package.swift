@@ -39,6 +39,14 @@ let package = Package(
                 "CoreAIObjectDetector"
             ]
         ),
+        // Low-level runtime utilities (PreparedModel, NDArray helpers) used by
+        // applications that need to build custom CoreAI runners.
+        .library(
+            name: "CoreAIShared",
+            targets: [
+                "CoreAIShared"
+            ]
+        ),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.2.0"),

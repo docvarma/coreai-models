@@ -17,6 +17,15 @@ enum PrefillStrategy {
     case oneAtATime
 }
 
+// MARK: - Extra Fixed-Shape States
+
+/// A model state beyond the KV-cache pair. Hybrid-attention models such as
+/// Qwen3.6 carry small recurrent/conv states alongside attention KV state.
+private struct SequentialExtraState {
+    let name: String
+    var array: NDArray
+}
+
 // MARK: - Core AI Sequential Clean Engine
 
 /// Clean Core AI inference engine built from scratch using only public APIs.
@@ -56,6 +65,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     // Persistent state — reused across steps
     private var keyCache: NDArray
     private var valueCache: NDArray
+    private var extraStates: [SequentialExtraState]
     private var logitsArray: NDArray
     // Pre-allocated input_ids reused across decode steps. Only reallocated when
     // batch size changes (i.e., once when transitioning from prefill to decode).
@@ -109,7 +119,9 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         }
         self.functionDescriptor = descriptor
 
-        // Validate model architecture: 2 inputs, 1+ output, 2 states
+        // Validate model architecture: 2 inputs, 1+ output, 2+ states.
+        // The first two states are the KV-cache pair. Additional fixed-shape
+        // states are carried across steps for hybrid-attention models.
         guard descriptor.inputNames.count == 2 else {
             throw InferenceRuntimeError.invalidInputType(
                 "Expected 2 inputs, got \(descriptor.inputNames.count): \(descriptor.inputNames)")
@@ -118,10 +130,15 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
             throw InferenceRuntimeError.invalidOutputType(
                 "Expected at least 1 output, got \(descriptor.outputNames.count): \(descriptor.outputNames)")
         }
-        guard descriptor.stateNames.count == 2 else {
+        guard descriptor.stateNames.count >= 2 else {
             throw InferenceRuntimeError.invalidOutputType(
-                "Expected 2 states (KV cache), got \(descriptor.stateNames.count): "
+                "Expected at least 2 states (KV cache), got \(descriptor.stateNames.count): "
                     + "states=\(descriptor.stateNames), outputs=\(descriptor.outputNames)")
+        }
+        guard descriptor.stateNames.count - 2 <= Self.maxExtraStates else {
+            throw InferenceRuntimeError.invalidOutputType(
+                "At most \(Self.maxExtraStates) extra states beyond the KV pair are supported, "
+                    + "got \(descriptor.stateNames.count - 2): \(descriptor.stateNames.dropFirst(2))")
         }
 
         // Extract names
@@ -184,6 +201,29 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
             "KV cache: dynamic=\(isDynamic), initial=\(initialCapacity), key=\(keyCacheDesc.shape) → \(resolvedKeyDesc.shape)"
         )
 
+        var extraStatesLocal: [SequentialExtraState] = []
+        for name in descriptor.stateNames.dropFirst(2) {
+            guard case .ndArray(let desc) = descriptor.stateDescriptor(of: name) else {
+                throw InferenceRuntimeError.invalidOutputType(
+                    "Cannot get descriptor for extra state '\(name)'")
+            }
+            guard !desc.shape.contains(where: { $0 < 0 }) else {
+                throw InferenceRuntimeError.invalidOutputType(
+                    "Extra state '\(name)' has dynamic dims \(desc.shape) — only the KV-cache pair may be dynamic")
+            }
+            let resolved = desc.resolvingDynamicDimensions(desc.shape)
+            var state = NDArray(descriptor: resolved)
+            zeroFillScalar(&state)
+            extraStatesLocal.append(SequentialExtraState(name: name, array: state))
+        }
+        self.extraStates = extraStatesLocal
+
+        if !extraStatesLocal.isEmpty {
+            CLILogger.log(
+                "CoreAI sequential engine carrying \(extraStatesLocal.count) fixed-shape extra state(s): "
+                    + extraStatesLocal.map(\.name).joined(separator: ", "))
+        }
+
         // Allocate initial logits (1 token — will be reallocated per batch)
         let initLogitsDesc = logitsDesc.resolvingDynamicDimensions([1, 1, config.vocabSize])
         self.logitsArray = NDArray(descriptor: initLogitsDesc)
@@ -226,8 +266,13 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     // MARK: - Prefill Strategy
 
     private func selectPrefillStrategy(newTokenCount: Int) -> PrefillStrategy {
+        let descriptorLimit = inputIdsDescriptor.shape.dropFirst().first(where: { $0 > 0 })
+        let chunkLimit = descriptorLimit.map { min($0, config.prefillChunkSize) } ?? config.prefillChunkSize
+        if let descriptorLimit, newTokenCount > descriptorLimit {
+            return .chunked(chunkSize: chunkLimit)
+        }
         if newTokenCount > config.chunkThreshold {
-            return .chunked(chunkSize: config.prefillChunkSize)
+            return .chunked(chunkSize: chunkLimit)
         }
         return .wholeBatch
     }
@@ -273,21 +318,57 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
             cachedLogitsBatchSize = batchSize
         }
 
-        // Build states (KV cache — persistent, inout)
-        var states = InferenceFunction.MutableViews()
-        states.insert(&keyCache, for: keyCacheName)
-        states.insert(&valueCache, for: valueCacheName)
+        let inputs = [inputIdsName: inputIdsArray, positionIdsName: positionIds]
+        switch extraStates.count {
+        case 0:
+            var states = InferenceFunction.MutableViews()
+            states.insert(&keyCache, for: keyCacheName)
+            states.insert(&valueCache, for: valueCacheName)
 
-        // Build output backings (logits — written in-place)
-        var outputViews = InferenceFunction.MutableViews()
-        outputViews.insert(&logitsArray, for: logitsName)
+            var outputViews = InferenceFunction.MutableViews()
+            outputViews.insert(&logitsArray, for: logitsName)
 
-        // Execute
-        _ = try await function.run(
-            inputs: [inputIdsName: inputIdsArray, positionIdsName: positionIds],
-            states: consume states,
-            outputViews: consume outputViews
-        )
+            _ = try await function.run(
+                inputs: inputs,
+                states: consume states,
+                outputViews: consume outputViews
+            )
+        case 1:
+            var extra0 = extraStates[0]
+            var states = InferenceFunction.MutableViews()
+            states.insert(&keyCache, for: keyCacheName)
+            states.insert(&valueCache, for: valueCacheName)
+            states.insert(&extra0.array, for: extra0.name)
+
+            var outputViews = InferenceFunction.MutableViews()
+            outputViews.insert(&logitsArray, for: logitsName)
+
+            _ = try await function.run(
+                inputs: inputs,
+                states: consume states,
+                outputViews: consume outputViews
+            )
+            extraStates[0] = extra0
+        default:
+            var extra0 = extraStates[0]
+            var extra1 = extraStates[1]
+            var states = InferenceFunction.MutableViews()
+            states.insert(&keyCache, for: keyCacheName)
+            states.insert(&valueCache, for: valueCacheName)
+            states.insert(&extra0.array, for: extra0.name)
+            states.insert(&extra1.array, for: extra1.name)
+
+            var outputViews = InferenceFunction.MutableViews()
+            outputViews.insert(&logitsArray, for: logitsName)
+
+            _ = try await function.run(
+                inputs: inputs,
+                states: consume states,
+                outputViews: consume outputViews
+            )
+            extraStates[0] = extra0
+            extraStates[1] = extra1
+        }
 
         // Read logits from NDArray
         let totalLogits = batchSize * config.vocabSize
@@ -416,6 +497,9 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
             history.clear()
             zeroFill(&keyCache)
             zeroFill(&valueCache)
+            for index in extraStates.indices {
+                zeroFillScalar(&extraStates[index].array)
+            }
         } else {
             processedTokenCount = tokenIndex
             history.truncate(to: tokenIndex)
@@ -506,6 +590,24 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
                 ptr[i] = 0
             }
         }
+    }
+
+    private static let maxExtraStates = 2
+}
+
+private func zeroFillScalar(_ array: inout NDArray) {
+    let count = array.shape.reduce(1, *)
+    switch array.scalarType {
+    case .float16:
+        fillNDArray(&array, as: Float16.self, count: count) { _ in 0 }
+    case .float32:
+        fillNDArray(&array, as: Float.self, count: count) { _ in 0 }
+    case .int32:
+        fillNDArray(&array, as: Int32.self, count: count) { _ in 0 }
+    case .uint32:
+        fillNDArray(&array, as: UInt32.self, count: count) { _ in 0 }
+    default:
+        preconditionFailure("zeroFillScalar: unsupported scalar type \(array.scalarType)")
     }
 }
 

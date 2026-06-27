@@ -72,13 +72,25 @@ public struct CoreAIRunner {
     /// Creates a LanguageModel for FM API usage.
     func makeLanguageModel() async throws -> CoreAILanguageModel {
         let modelLoadSpan = InstrumentsProfiler.beginModelLoad(name: bundle.name)
-        let engine = try await makeInferenceEngine()
-        modelLoadSpan.end()
+        let engine: any InferenceEngine
+        do {
+            engine = try await makeInferenceEngine()
+            modelLoadSpan.end()
+        } catch {
+            modelLoadSpan.end()
+            throw error
+        }
 
         let tokenizerLoadSpan = InstrumentsProfiler.beginTokenizerLoad(
             id: bundle.tokenizer)
-        let tokenizer = try await bundle.loadTokenizer()
-        tokenizerLoadSpan.end()
+        let tokenizer: any Tokenizer
+        do {
+            tokenizer = try await bundle.loadTokenizer()
+            tokenizerLoadSpan.end()
+        } catch {
+            tokenizerLoadSpan.end()
+            throw error
+        }
 
         // Read additional stop token IDs from tokenizer_config.json
         let additionalEos: [Int32]
