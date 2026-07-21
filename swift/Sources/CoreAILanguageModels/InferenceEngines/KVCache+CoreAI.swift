@@ -122,6 +122,16 @@ enum KVCacheFactory {
         }
     }
 
+    static func shape(
+        _ template: [Int],
+        replacingDimension dimension: Int,
+        with capacity: Int
+    ) -> [Int] {
+        var shape = template
+        shape[dimension] = capacity
+        return shape
+    }
+
     /// Create a KV cache based on the specified options.
     ///
     /// For `.auto` strategy, this factory auto-selects:
@@ -241,14 +251,13 @@ struct StaticKVCache: CoreAIKVCache {
             self.currentCapacity = min(capacity ?? maxCapacityFromModel, maxCapacityFromModel)
         }
 
-        // Create modified requirements with adjusted sequence dimension.
-        var keyReqsMod = keyReqs
-        var valueReqsMod = valueReqs
-        keyReqsMod.shape[seqDim] = self.currentCapacity
-        valueReqsMod.shape[seqDim] = self.currentCapacity
+        let keyShape = KVCacheFactory.shape(
+            keyReqs.shape, replacingDimension: seqDim, with: self.currentCapacity)
+        let valueShape = KVCacheFactory.shape(
+            valueReqs.shape, replacingDimension: seqDim, with: self.currentCapacity)
 
-        let keyResolved = keyReqsMod.resolvingDynamicDimensions(keyReqsMod.shape)
-        let valueResolved = valueReqsMod.resolvingDynamicDimensions(valueReqsMod.shape)
+        let keyResolved = keyReqs.resolvingDynamicDimensions(keyShape)
+        let valueResolved = valueReqs.resolvingDynamicDimensions(valueShape)
 
         let keyByteCount = keyResolved.minimumByteCount
         let valueByteCount = valueResolved.minimumByteCount
@@ -260,16 +269,16 @@ struct StaticKVCache: CoreAIKVCache {
         }
 
         self.keyBinding = TensorBinding(
-            metalBuffer: keyBuf, shape: keyReqsMod.shape,
+            metalBuffer: keyBuf, shape: keyShape,
             strides: keyResolved.preferredStrides, scalarType: keyReqs.scalarType)
         self.valueBinding = TensorBinding(
-            metalBuffer: valueBuf, shape: valueReqsMod.shape,
+            metalBuffer: valueBuf, shape: valueShape,
             strides: valueResolved.preferredStrides, scalarType: valueReqs.scalarType)
 
         // Log final allocation summary
         let fmt = ByteCountFormatter()
         fmt.countStyle = .memory
-        let shapeDesc = KVCacheFactory.describeKVCacheStructure(shape: keyReqsMod.shape)
+        let shapeDesc = KVCacheFactory.describeKVCacheStructure(shape: keyShape)
         CLILogger.log(
             "StaticKVCache allocated: \(shapeDesc), Total: \(fmt.string(fromByteCount: Int64(keyByteCount + valueByteCount)))"
         )
@@ -354,14 +363,13 @@ struct GrowingKVCache: CoreAIKVCache {
         self.maxCapacity = maxCapacityFromModel > 0 ? maxCapacityFromModel : Int.max
         self.currentCapacity = initialCapacity
 
-        // Create modified requirements with initial capacity.
-        var keyReqsMod = keyReqs
-        var valueReqsMod = valueReqs
-        keyReqsMod.shape[sequenceDim] = self.currentCapacity
-        valueReqsMod.shape[sequenceDim] = self.currentCapacity
+        let keyShape = KVCacheFactory.shape(
+            keyReqs.shape, replacingDimension: sequenceDim, with: self.currentCapacity)
+        let valueShape = KVCacheFactory.shape(
+            valueReqs.shape, replacingDimension: sequenceDim, with: self.currentCapacity)
 
-        let keyResolved = keyReqsMod.resolvingDynamicDimensions(keyReqsMod.shape)
-        let valueResolved = valueReqsMod.resolvingDynamicDimensions(valueReqsMod.shape)
+        let keyResolved = keyReqs.resolvingDynamicDimensions(keyShape)
+        let valueResolved = valueReqs.resolvingDynamicDimensions(valueShape)
 
         let keyByteCount = keyResolved.minimumByteCount
         let valueByteCount = valueResolved.minimumByteCount
@@ -373,16 +381,16 @@ struct GrowingKVCache: CoreAIKVCache {
         }
 
         self.keyBinding = TensorBinding(
-            metalBuffer: keyBuf, shape: keyReqsMod.shape,
+            metalBuffer: keyBuf, shape: keyShape,
             strides: keyResolved.preferredStrides, scalarType: keyReqs.scalarType)
         self.valueBinding = TensorBinding(
-            metalBuffer: valueBuf, shape: valueReqsMod.shape,
+            metalBuffer: valueBuf, shape: valueShape,
             strides: valueResolved.preferredStrides, scalarType: valueReqs.scalarType)
 
         // Log final allocation summary
         let fmt = ByteCountFormatter()
         fmt.countStyle = .memory
-        let shapeDesc = KVCacheFactory.describeKVCacheStructure(shape: keyReqsMod.shape)
+        let shapeDesc = KVCacheFactory.describeKVCacheStructure(shape: keyShape)
         CLILogger.log(
             "GrowingKVCache allocated (initial): \(shapeDesc), Total: \(fmt.string(fromByteCount: Int64(keyByteCount + valueByteCount)))"
         )
@@ -432,14 +440,13 @@ struct GrowingKVCache: CoreAIKVCache {
         }
         guard newCapacity > currentCapacity else { return nil }
 
-        // Create modified requirements with new capacity
-        var keyReqsMod = keyReqsTemplate
-        var valueReqsMod = valueReqsTemplate
-        keyReqsMod.shape[sequenceDim] = newCapacity
-        valueReqsMod.shape[sequenceDim] = newCapacity
+        let keyShape = KVCacheFactory.shape(
+            keyReqsTemplate.shape, replacingDimension: sequenceDim, with: newCapacity)
+        let valueShape = KVCacheFactory.shape(
+            valueReqsTemplate.shape, replacingDimension: sequenceDim, with: newCapacity)
 
-        let keyResolved = keyReqsMod.resolvingDynamicDimensions(keyReqsMod.shape)
-        let valueResolved = valueReqsMod.resolvingDynamicDimensions(valueReqsMod.shape)
+        let keyResolved = keyReqsTemplate.resolvingDynamicDimensions(keyShape)
+        let valueResolved = valueReqsTemplate.resolvingDynamicDimensions(valueShape)
 
         let newKeyByteCount = keyResolved.minimumByteCount
         let newValueByteCount = valueResolved.minimumByteCount
@@ -455,7 +462,7 @@ struct GrowingKVCache: CoreAIKVCache {
         let oldValueBuf = valueBinding.metalBuffer
 
         // Extract shape dimensions: [L, B, H, S, D]
-        let shape = keyReqsMod.shape
+        let shape = keyShape
         let l = shape[0]
         let b = shape[1]
         let h = shape[2]
@@ -476,15 +483,15 @@ struct GrowingKVCache: CoreAIKVCache {
 
         // Update bindings to new buffers (CPU metadata only — safe before GPU executes)
         keyBinding = TensorBinding(
-            metalBuffer: newKeyBuf, shape: keyReqsMod.shape,
+            metalBuffer: newKeyBuf, shape: keyShape,
             strides: keyResolved.preferredStrides, scalarType: keyReqsTemplate.scalarType)
         valueBinding = TensorBinding(
-            metalBuffer: newValueBuf, shape: valueReqsMod.shape,
+            metalBuffer: newValueBuf, shape: valueShape,
             strides: valueResolved.preferredStrides, scalarType: valueReqsTemplate.scalarType)
 
         let fmt = ByteCountFormatter()
         fmt.countStyle = .memory
-        let shapeDesc = KVCacheFactory.describeKVCacheStructure(shape: keyReqsMod.shape)
+        let shapeDesc = KVCacheFactory.describeKVCacheStructure(shape: keyShape)
         CLILogger.log(
             "GrowingKVCache pipelined grow: \(currentCapacity) → \(newCapacity), \(shapeDesc), Total: \(fmt.string(fromByteCount: Int64(newKeyByteCount + newValueByteCount)))"
         )

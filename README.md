@@ -3,10 +3,12 @@
 > [!IMPORTANT]
 > This is an unofficial compatibility repository based on
 > [apple/coreai-models](https://github.com/apple/coreai-models). It carries a
-> narrow runtime patch for the fixed-shape extra states used by Qwen3.6. The
-> runtime patch is commit `c01ade6b08e00ca09243fe386b65481afd1b8d53`, based on
-> Apple commit `34f0db331dd69d0b295d5f69b3edce7347115e43`. Consumers should pin an
-> exact commit. Apple does not maintain or support the compatibility patch.
+> narrow runtime patch for the fixed-shape extra states used by Qwen3.6,
+> originally introduced in commit `c01ade6b08e00ca09243fe386b65481afd1b8d53`
+> on Apple commit `34f0db331dd69d0b295d5f69b3edce7347115e43`. The current compatibility
+> line also supports the Xcode 27 beta 4 Core AI APIs for immutable NDArray
+> descriptors and consuming mutable views. Consumers should pin an exact
+> commit. Apple does not maintain or support the compatibility patch.
 
 Model export recipes, Python primitives, and Swift runtime utilities for building on-device AI with [Core AI](https://developer.apple.com/documentation/coreai).
 

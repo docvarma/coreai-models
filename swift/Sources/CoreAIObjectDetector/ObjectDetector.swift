@@ -205,10 +205,10 @@ public struct ObjectDetector {
 
         if descriptor.scalarType == .float16 {
             #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
-            var view = imageArray.mutableView(as: Float16.self)
-            for (b, image) in images.enumerated() {
-                let chw = try preprocessor.preprocessCHW(cgImage: image)
-                view.withUnsafeMutablePointer { ptr, _, _ in
+            let view = imageArray.mutableView(as: Float16.self)
+            try view.withUnsafeMutablePointer { ptr, _, _ in
+                for (b, image) in images.enumerated() {
+                    let chw = try preprocessor.preprocessCHW(cgImage: image)
                     let slot = ptr.advanced(by: b * slotCount)
                     for i in 0..<slotCount { slot[i] = Float16(chw[i]) }
                 }
@@ -217,10 +217,10 @@ public struct ObjectDetector {
             fatalError("Float16 is not supported on this platform")
             #endif
         } else {
-            var view = imageArray.mutableView(as: Float.self)
-            for (b, image) in images.enumerated() {
-                let chw = try preprocessor.preprocessCHW(cgImage: image)
-                view.withUnsafeMutablePointer { ptr, _, _ in
+            let view = imageArray.mutableView(as: Float.self)
+            try view.withUnsafeMutablePointer { ptr, _, _ in
+                for (b, image) in images.enumerated() {
+                    let chw = try preprocessor.preprocessCHW(cgImage: image)
                     let slot = ptr.advanced(by: b * slotCount)
                     chw.withUnsafeBufferPointer { src in
                         slot.update(from: src.baseAddress!, count: slotCount)
