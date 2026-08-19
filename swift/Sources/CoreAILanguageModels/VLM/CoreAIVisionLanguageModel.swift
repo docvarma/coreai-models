@@ -7,8 +7,10 @@
 
 import CoreAI
 import CoreGraphics
+import CoreImage
 import Foundation
 import FoundationModels
+import ImageIO
 import Tokenizers
 
 // MARK: - CoreAIVisionLanguageModel
@@ -37,7 +39,10 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
     /// Loads a VLM bundle and builds the backing engine.
     ///
     /// - Parameter url: URL to the bundle directory (`kind=vlm`).
-    public init(resourcesAt url: URL) async throws {
+    public init(
+        resourcesAt url: URL,
+        requestAdmission: CoreAIRequestAdmission? = nil
+    ) async throws {
         let bundle = try LanguageBundle(at: url)
         guard bundle.bundle.kind == .vlm else {
             throw InferenceRuntimeError.invalidArgument(
@@ -80,7 +85,8 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
             bundleURL: url,
             engine: engine,
             tokenizer: try await tokenizerResult,
-            visionConfig: visionConfig
+            visionConfig: visionConfig,
+            requestAdmission: requestAdmission
         )
     }
 }
@@ -95,23 +101,28 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         let engine: CoreAISequentialVLMEngine
         let tokenizer: any Tokenizer
         let visionConfig: VisionConfig
+        let requestAdmission: CoreAIRequestAdmission?
 
         public static func == (lhs: Configuration, rhs: Configuration) -> Bool {
             lhs.bundleURL == rhs.bundleURL
+                && lhs.requestAdmission == rhs.requestAdmission
         }
         public func hash(into hasher: inout Hasher) {
             hasher.combine(bundleURL)
+            hasher.combine(requestAdmission)
         }
     }
 
     private let engine: CoreAISequentialVLMEngine
     private let tokenizer: any Tokenizer
     private let visionConfig: VisionConfig
+    private let requestAdmission: CoreAIRequestAdmission?
 
     public init(configuration: Configuration) throws {
         self.engine = configuration.engine
         self.tokenizer = configuration.tokenizer
         self.visionConfig = configuration.visionConfig
+        self.requestAdmission = configuration.requestAdmission
     }
 
     public nonisolated(nonsending) func respond(
@@ -119,7 +130,7 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         model: CoreAIVisionLanguageModel,
         streamingInto channel: LanguageModelExecutorGenerationChannel
     ) async throws {
-        var cgImage: CGImage?
+        var images: [Transcript.ImageAttachment] = []
         var userText = ""
         for entry in request.transcript {
             guard case .prompt(let prompt) = entry else { continue }
@@ -128,8 +139,8 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
                 case .text(let text):
                     userText += text.content
                 case .attachment(let attachment):
-                    if cgImage == nil, case .image(let image) = attachment.content {
-                        cgImage = image.cgImage
+                    if case .image(let image) = attachment.content {
+                        images.append(image)
                     }
                 default:
                     break
@@ -137,14 +148,8 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
             }
         }
 
-        guard let cgImage else {
-            throw LanguageModelError.unsupportedTranscriptContent(
-                .init(
-                    unsupportedContent: Array(request.transcript),
-                    debugDescription:
-                        "CoreAIVisionLanguageModel requires an image attachment in the prompt."
-                ))
-        }
+        try Self.validateImageCount(images.count)
+        let cgImage = try Self.uprightCGImage(from: images[0])
 
         try await engine.reset()
         let embeddedInput = try await engine.encodeImage(cgImage: cgImage)
@@ -157,16 +162,25 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         )
 
         let maxTokens = request.generationOptions.maximumResponseTokens ?? 512
+        let metrics = CoreAIRequestMetrics(
+            inputTokenCount: promptTokens.count,
+            reservedOutputTokenCount: maxTokens,
+            attachmentCount: images.count)
         var stopTokens = Set<Int32>()
         if let eos = tokenizer.eosTokenId { stopTokens.insert(Int32(eos)) }
         if let imEnd = tokenizer.convertTokenToId("<|im_end|>") { stopTokens.insert(Int32(imEnd)) }
 
-        let stream = try await engine.generate(
-            with: embeddedInput,
-            tokens: promptTokens,
-            samplingConfiguration: SamplingConfiguration(temperature: 1.0, topK: 1),
-            inferenceOptions: InferenceOptions(maxTokens: maxTokens, includeLogits: false)
-        )
+        let stream = try await CoreAIRequestAdmission.perform(
+            metrics: metrics,
+            admission: requestAdmission
+        ) {
+            try await engine.generate(
+                with: embeddedInput,
+                tokens: promptTokens,
+                samplingConfiguration: SamplingConfiguration(temperature: 1.0, topK: 1),
+                inferenceOptions: InferenceOptions(maxTokens: maxTokens, includeLogits: false)
+            )
+        }
 
         var generatedCount = 0
         var pendingTokens: [Int] = []
@@ -201,6 +215,25 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
     }
 
     // MARK: - Prompt Construction
+
+    static func uprightCGImage(
+        from image: Transcript.ImageAttachment
+    ) throws -> CGImage {
+        let oriented = image.ciImage.oriented(image.orientation)
+        let extent = oriented.extent.integral
+        guard !extent.isEmpty,
+            let rendered = CIContext(options: nil).createCGImage(oriented, from: extent)
+        else {
+            throw CoreAIVisionRequestError.imageRenderFailed
+        }
+        return rendered
+    }
+
+    static func validateImageCount(_ count: Int) throws {
+        guard count == 1 else {
+            throw CoreAIVisionRequestError.requiresExactlyOneImage(actualCount: count)
+        }
+    }
 
     /// Builds the token sequence for a single-image prompt.
     private static func buildPromptTokens(
@@ -240,4 +273,12 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
             + "\(userText)<|im_end|>\n<|im_start|>assistant\n"
         return tokenizer.encode(text: chatText).map { Int32($0) }
     }
+}
+
+/// Fail-closed request validation errors for the currently pinned Core AI VLM
+/// adapter. Its backend supports one image per generation and does not accept a
+/// text-only request.
+public enum CoreAIVisionRequestError: Error, Equatable, Sendable {
+    case requiresExactlyOneImage(actualCount: Int)
+    case imageRenderFailed
 }

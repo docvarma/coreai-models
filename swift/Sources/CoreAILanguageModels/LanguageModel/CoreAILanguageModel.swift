@@ -43,11 +43,12 @@ public struct CoreAILanguageModel: LanguageModel {
     fileprivate let samplingConfig: SamplingConfiguration
     fileprivate let bundle: LanguageBundle
     fileprivate let tokenizer: any Tokenizer
-    fileprivate let thinkingMarkers: (open: String, close: String)
+    fileprivate let thinkingMarkers: (open: String, close: String)?
     fileprivate let toolCallMarkers: (open: String, close: String)?
     private let supportsToolCalling: Bool
     fileprivate let supportsReasoning: Bool
     fileprivate let resources: ModelResources
+    fileprivate let requestAdmission: CoreAIRequestAdmission?
     /// All EOS-like token IDs beyond the tokenizer's main `eosTokenId` — e.g.
     /// Gemma's `<end_of_turn>`, read from tokenizer_config.json at init.
     fileprivate let additionalEosTokenIds: [Int32]
@@ -71,7 +72,8 @@ public struct CoreAILanguageModel: LanguageModel {
             kvCacheStrategy: kvCacheStrategy,
             modelIdentifier: bundle.name,
             samplingConfig: samplingConfig,
-            vocabSize: bundle.vocabSize
+            vocabSize: bundle.vocabSize,
+            requestAdmission: requestAdmission
         )
     }
 
@@ -98,7 +100,8 @@ public struct CoreAILanguageModel: LanguageModel {
         resourcesAt url: URL,
         mode: LoadMode = .lazy,
         variant: String? = nil,
-        kvCacheStrategy: KVCacheStrategy = .auto
+        kvCacheStrategy: KVCacheStrategy = .auto,
+        requestAdmission: CoreAIRequestAdmission? = nil
     ) async throws {
         let bundle = try LanguageBundle(at: url)
         let configuration = CoreAIExecutor.Configuration(
@@ -107,7 +110,8 @@ public struct CoreAILanguageModel: LanguageModel {
             kvCacheStrategy: kvCacheStrategy,
             modelIdentifier: bundle.name,
             samplingConfig: .greedy,
-            vocabSize: bundle.vocabSize
+            vocabSize: bundle.vocabSize,
+            requestAdmission: requestAdmission
         )
         let resources = ModelResources.shared(for: configuration)
 
@@ -122,14 +126,15 @@ public struct CoreAILanguageModel: LanguageModel {
         try await engineLoad
         self.init(
             configuration: configuration, bundle: bundle, tokenizer: tokenizer,
-            resources: resources)
+            resources: resources, requestAdmission: requestAdmission)
     }
 
-    private init(
+    init(
         configuration: CoreAIExecutor.Configuration,
         bundle: LanguageBundle,
         tokenizer: any Tokenizer,
-        resources: ModelResources
+        resources: ModelResources,
+        requestAdmission: CoreAIRequestAdmission?
     ) {
         let toolCallMarkers = CoreAIExecutor.detectToolCallMarkers(using: tokenizer)
         self.url = configuration.url
@@ -141,10 +146,9 @@ public struct CoreAILanguageModel: LanguageModel {
         self.thinkingMarkers = CoreAIExecutor.detectThinkingMarkers(using: tokenizer)
         self.toolCallMarkers = toolCallMarkers
         self.supportsToolCalling = toolCallMarkers != nil
-        self.supportsReasoning =
-            tokenizer.convertTokenToId("<think>") != nil
-            || tokenizer.convertTokenToId("<|reasoning_start|>") != nil
+        self.supportsReasoning = thinkingMarkers != nil
         self.resources = resources
+        self.requestAdmission = requestAdmission
         // Read additional stop token IDs from tokenizer_config.json (e.g. Gemma's
         // <end_of_turn>). Empty when the bundle has no tokenizer directory.
         if let tokenizerDir = bundle.tokenizerPath {
@@ -195,6 +199,7 @@ public struct CoreAILanguageModel: LanguageModel {
             let modelIdentifier: String
             let samplingConfig: SamplingConfiguration
             let vocabSize: Int?
+            let requestAdmission: CoreAIRequestAdmission?
         }
 
         // MARK: - Properties
@@ -210,17 +215,16 @@ public struct CoreAILanguageModel: LanguageModel {
         /// Probes the tokenizer for known reasoning marker pairs. Each
         /// candidate pair is verified to exist as added/special tokens via
         /// `convertTokenToId(_:)` — only models that actually have these
-        /// tokens in their vocab match. First match wins; falls back to
-        /// `<think>`/`</think>` so the parser is harmless on models that
-        /// don't emit reasoning markup at all.
+        /// tokens in their vocab match. First match wins. Models without a
+        /// complete pair do not advertise reasoning.
         ///
         /// Add a new pair here when onboarding a model with different
         /// markers. For models with non-pair-symmetric formats (e.g.
         /// gpt-oss / Harmony), a different parser is needed; this one
         /// covers the `<open>...</close>` shape.
-        fileprivate static func detectThinkingMarkers(
+        static func detectThinkingMarkers(
             using tokenizer: any Tokenizer
-        ) -> (open: String, close: String) {
+        ) -> (open: String, close: String)? {
             let candidates: [(open: String, close: String)] = [
                 ("<think>", "</think>"),
                 ("<|reasoning_start|>", "<|reasoning_end|>"),
@@ -232,7 +236,7 @@ public struct CoreAILanguageModel: LanguageModel {
                     return pair
                 }
             }
-            return ("<think>", "</think>")
+            return nil
         }
 
         /// Probes the tokenizer for known tool call marker pairs. Each
@@ -307,6 +311,14 @@ public struct CoreAILanguageModel: LanguageModel {
             let defaultMaxTokens = model.supportsReasoning ? 2048 : 512
             let maxTokens = request.generationOptions.maximumResponseTokens ?? defaultMaxTokens
 
+            try Self.validateReasoning(
+                request.contextOptions.reasoningLevel,
+                supportsReasoning: model.supportsReasoning)
+            let metrics = CoreAIRequestMetrics(
+                inputTokenCount: promptTokens.count,
+                reservedOutputTokenCount: maxTokens,
+                attachmentCount: Self.attachmentCount(in: request.transcript))
+
             // Borrow the engine for the whole generation.
             try await resources.withEngine { engine in
                 // FoundationModels now threads entry identity itself based on event
@@ -331,6 +343,8 @@ public struct CoreAILanguageModel: LanguageModel {
                         promptTokens: promptTokens,
                         samplingConfig: effectiveSamplingConfig,
                         maxTokens: maxTokens,
+                        metrics: metrics,
+                        admission: model.requestAdmission,
                         channel: channel
                     )
                 } else {
@@ -340,6 +354,8 @@ public struct CoreAILanguageModel: LanguageModel {
                         promptTokens: promptTokens,
                         samplingConfig: effectiveSamplingConfig,
                         maxTokens: maxTokens,
+                        metrics: metrics,
+                        admission: model.requestAdmission,
                         channel: channel
                     )
                 }
@@ -354,14 +370,21 @@ public struct CoreAILanguageModel: LanguageModel {
             promptTokens: [Int],
             samplingConfig: SamplingConfiguration,
             maxTokens: Int,
+            metrics: CoreAIRequestMetrics,
+            admission: CoreAIRequestAdmission?,
             channel: LanguageModelExecutorGenerationChannel
         ) async throws {
             let tokenizer = model.tokenizer
-            let tokenStream = try await engine.generate(
-                with: promptTokens.map(Int32.init),
-                samplingConfiguration: samplingConfig,
-                inferenceOptions: InferenceOptions(maxTokens: maxTokens)
-            )
+            let tokenStream = try await CoreAIRequestAdmission.perform(
+                metrics: metrics,
+                admission: admission
+            ) {
+                try await engine.generate(
+                    with: promptTokens.map(Int32.init),
+                    samplingConfiguration: samplingConfig,
+                    inferenceOptions: InferenceOptions(maxTokens: maxTokens)
+                )
+            }
 
             // All EOS-like tokens: the tokenizer's main EOS plus any additional
             // stop tokens from tokenizer_config.json (e.g. Gemma's <end_of_turn>).
@@ -384,10 +407,9 @@ public struct CoreAILanguageModel: LanguageModel {
             // its own `Transcript.Reasoning` entry, not mixed into the
             // user-facing `Transcript.Response`. Markers were resolved at
             // model init from the tokenizer's known token ids.
-            var thinkParser = ThinkTagParser(
-                open: model.thinkingMarkers.open,
-                close: model.thinkingMarkers.close
-            )
+            var thinkParser = model.thinkingMarkers.map {
+                ThinkTagParser(open: $0.open, close: $0.close)
+            }
             // Routes tool call markup to .toolCalls(...) channel events.
             // nil when the model's tokenizer has no tool call tokens.
             var toolCallParser: ToolCallParser? = model.toolCallMarkers.map {
@@ -433,7 +455,14 @@ public struct CoreAILanguageModel: LanguageModel {
                     continue
                 }
 
-                for event in thinkParser.consume(delta) {
+                let events: [ThinkTagParser.Event]
+                if var parser = thinkParser {
+                    events = parser.consume(delta)
+                    thinkParser = parser
+                } else {
+                    events = [.text(delta)]
+                }
+                for event in events {
                     if case .reasoning = event { reasoningTokenCount += 1 }
                     await dispatch(event: event, toolCallParser: &toolCallParser, channel: channel)
                 }
@@ -458,8 +487,11 @@ public struct CoreAILanguageModel: LanguageModel {
             // Flush parsers — drains any content held back waiting for a marker.
             // Without this, content right at the EOS boundary (or inside an
             // unclosed block) would be lost.
-            for event in thinkParser.flush() {
-                await dispatch(event: event, toolCallParser: &toolCallParser, channel: channel)
+            if var parser = thinkParser {
+                for event in parser.flush() {
+                    await dispatch(event: event, toolCallParser: &toolCallParser, channel: channel)
+                }
+                thinkParser = parser
             }
             if var tcp = toolCallParser {
                 for event in tcp.flush() {
@@ -555,6 +587,8 @@ public struct CoreAILanguageModel: LanguageModel {
             promptTokens: [Int],
             samplingConfig: SamplingConfiguration,
             maxTokens: Int,
+            metrics: CoreAIRequestMetrics,
+            admission: CoreAIRequestAdmission?,
             channel: LanguageModelExecutorGenerationChannel
         ) async throws {
             let schemaData = try JSONEncoder().encode(schema)
@@ -576,14 +610,19 @@ public struct CoreAILanguageModel: LanguageModel {
                 additionalEosTokenIds: model.additionalEosTokenIds
             )
 
-            let stream = try await strategy.decode(
-                from: .tokens(promptTokens),
-                tokenizer: model.tokenizer,
-                inferenceEngine: engine,
-                samplingConfiguration: samplingConfig,
-                options: InferenceOptions(maxTokens: maxTokens),
-                stopSequences: stopSequences
-            )
+            let stream = try await CoreAIRequestAdmission.perform(
+                metrics: metrics,
+                admission: admission
+            ) {
+                try await strategy.decode(
+                    from: .tokens(promptTokens),
+                    tokenizer: model.tokenizer,
+                    inferenceEngine: engine,
+                    samplingConfiguration: samplingConfig,
+                    options: InferenceOptions(maxTokens: maxTokens),
+                    stopSequences: stopSequences
+                )
+            }
 
             // Bridge AsyncThrowingStream -> LanguageModelExecutorGenerationChannel
             var generatedTokenCount = 0
@@ -706,6 +745,51 @@ public struct CoreAILanguageModel: LanguageModel {
                     component: component)
                 let text = messages.compactMap { $0["content"] as? String }.joined(separator: "\n")
                 return tokenizer.encode(text: text)
+            }
+        }
+
+        private static func attachmentCount(in transcript: Transcript) -> Int {
+            transcript.reduce(into: 0) { count, entry in
+                let segments: [Transcript.Segment]
+                switch entry {
+                case .instructions(let value): segments = value.segments
+                case .prompt(let value): segments = value.segments
+                case .response(let value): segments = value.segments
+                case .toolOutput(let value): segments = value.segments
+                default: return
+                }
+                count += segments.reduce(into: 0) { partial, segment in
+                    if case .attachment = segment { partial += 1 }
+                }
+            }
+        }
+
+        private static func validateReasoning(
+            _ level: ContextOptions.ReasoningLevel?,
+            supportsReasoning: Bool
+        ) throws {
+            guard let level else { return }
+            switch level {
+            case .light, .moderate, .deep:
+                guard supportsReasoning else {
+                    throw LanguageModelError.unsupportedCapability(
+                        .init(
+                            capability: .reasoning,
+                            debugDescription: "This Core AI model does not support reasoning."))
+                }
+            case .custom(let value):
+                let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if normalized == "no_think", !supportsReasoning { return }
+                throw LanguageModelError.unsupportedCapability(
+                    .init(
+                        capability: .reasoning,
+                        debugDescription:
+                            "This Core AI adapter cannot honor the requested reasoning policy."))
+            @unknown default:
+                throw LanguageModelError.unsupportedCapability(
+                    .init(
+                        capability: .reasoning,
+                        debugDescription: "This Core AI adapter does not recognize the reasoning level."))
             }
         }
 
