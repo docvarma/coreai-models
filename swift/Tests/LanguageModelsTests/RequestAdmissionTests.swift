@@ -6,8 +6,10 @@
 import CoreGraphics
 import FoundationModels
 import ImageIO
-import Testing
+import Synchronization
 import TestUtilities
+import Testing
+import Tokenizers
 
 @testable import CoreAILanguageModels
 
@@ -120,6 +122,10 @@ struct RequestAdmissionTests {
 
 @Suite("Core AI reasoning markers")
 struct ReasoningMarkerTests {
+    private enum TemplateFailure: Error {
+        case rejected
+    }
+
     @Test("only a complete marker pair advertises reasoning")
     func completePairRequired() {
         let complete = MockTokenizer(vocab: ["<think>": 10, "</think>": 11])
@@ -129,6 +135,76 @@ struct ReasoningMarkerTests {
         #expect(CoreAILanguageModel.CoreAIExecutor.detectThinkingMarkers(using: complete) != nil)
         #expect(CoreAILanguageModel.CoreAIExecutor.detectThinkingMarkers(using: openingOnly) == nil)
         #expect(CoreAILanguageModel.CoreAIExecutor.detectThinkingMarkers(using: closingOnly) == nil)
+    }
+
+    @Test("automatic reasoning does not set a template flag")
+    func automaticReasoningTemplateContext() throws {
+        let observedContext = Mutex<Bool?>(nil)
+        let tokenizer = MockTokenizer(additionalContextObserver: { context in
+            observedContext.withLock { $0 = context != nil }
+        })
+        let context = try CoreAILanguageModel.CoreAIExecutor.reasoningTemplateContext(
+            nil,
+            supportsReasoning: true)
+
+        _ = try CoreAILanguageModel.CoreAIExecutor.applyChatTemplate(
+            messages: [["role": "user", "content": "synthetic"] as Message],
+            tools: nil,
+            using: tokenizer,
+            additionalContext: context)
+
+        #expect(observedContext.withLock { $0 } == false)
+    }
+
+    @Test("disabled reasoning passes enable_thinking false to the tokenizer")
+    func disabledReasoningTemplateContext() throws {
+        let observedContext = Mutex<Bool?>(nil)
+        let observedFlag = Mutex<Bool?>(nil)
+        let tokenizer = MockTokenizer(
+            vocab: ["<think>": 10, "</think>": 11],
+            additionalContextObserver: { context in
+                observedContext.withLock { $0 = context != nil }
+                observedFlag.withLock { $0 = context?["enable_thinking"] as? Bool }
+            })
+        let context = try CoreAILanguageModel.CoreAIExecutor.reasoningTemplateContext(
+            .custom("no_think"),
+            supportsReasoning: true)
+
+        _ = try CoreAILanguageModel.CoreAIExecutor.applyChatTemplate(
+            messages: [["role": "user", "content": "synthetic"] as Message],
+            tools: nil,
+            using: tokenizer,
+            additionalContext: context)
+
+        #expect(observedContext.withLock { $0 } == true)
+        #expect(observedFlag.withLock { $0 } == false)
+    }
+
+    @Test("unknown reasoning policies are rejected")
+    func unknownReasoningPolicy() {
+        #expect(throws: LanguageModelError.self) {
+            _ = try CoreAILanguageModel.CoreAIExecutor.reasoningTemplateContext(
+                .custom("unsupported"),
+                supportsReasoning: true)
+        }
+    }
+
+    @Test("disabled reasoning never falls back when the template rejects its flag")
+    func disabledReasoningTemplateFailure() throws {
+        let tokenizer = MockTokenizer(additionalContextObserver: { _ in
+            throw TemplateFailure.rejected
+        })
+        let context = try CoreAILanguageModel.CoreAIExecutor.reasoningTemplateContext(
+            .custom("no_think"),
+            supportsReasoning: true)
+
+        #expect(throws: LanguageModelError.self) {
+            _ = try CoreAILanguageModel.CoreAIExecutor.applyChatTemplate(
+                messages: [["role": "user", "content": "synthetic"] as Message],
+                tools: nil,
+                using: tokenizer,
+                additionalContext: context)
+        }
     }
 }
 
