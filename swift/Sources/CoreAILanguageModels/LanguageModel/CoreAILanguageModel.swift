@@ -287,10 +287,14 @@ public struct CoreAILanguageModel: LanguageModel {
         ) async throws {
             // Tokenization span
             let tokenizationSpan = InstrumentsProfiler.beginTokenization(inputLength: 0)
-            let promptTokens = Self.makeTokens(
+            let reasoningTemplateContext = try Self.reasoningTemplateContext(
+                request.contextOptions.reasoningLevel,
+                supportsReasoning: model.supportsReasoning)
+            let promptTokens = try Self.makeTokens(
                 from: Array(request.transcript),
                 using: model.tokenizer,
                 tools: request.enabledToolDefinitions,
+                additionalContext: reasoningTemplateContext,
                 component: "CoreAIExecutor"
             )
             guard !promptTokens.isEmpty else {
@@ -311,9 +315,6 @@ public struct CoreAILanguageModel: LanguageModel {
             let defaultMaxTokens = model.supportsReasoning ? 2048 : 512
             let maxTokens = request.generationOptions.maximumResponseTokens ?? defaultMaxTokens
 
-            try Self.validateReasoning(
-                request.contextOptions.reasoningLevel,
-                supportsReasoning: model.supportsReasoning)
             let metrics = CoreAIRequestMetrics(
                 inputTokenCount: promptTokens.count,
                 reservedOutputTokenCount: maxTokens,
@@ -685,8 +686,9 @@ public struct CoreAILanguageModel: LanguageModel {
             from entries: [Transcript.Entry],
             using tokenizer: any Tokenizer,
             tools: [Transcript.ToolDefinition] = [],
+            additionalContext: [String: any Sendable]? = nil,
             component: String = "CoreAIExecutor"
-        ) -> [Int] {
+        ) throws -> [Int] {
             var messages: [Message] = []
 
             for entry in entries {
@@ -736,10 +738,35 @@ public struct CoreAILanguageModel: LanguageModel {
 
             let toolSpecs: [ToolSpec]? = tools.isEmpty ? nil : tools.compactMap { makeToolSpec(from: $0) }
 
+            return try applyChatTemplate(
+                messages: messages,
+                tools: toolSpecs,
+                using: tokenizer,
+                additionalContext: additionalContext,
+                component: component)
+        }
+
+        static func applyChatTemplate(
+            messages: [Message],
+            tools: [ToolSpec]?,
+            using tokenizer: any Tokenizer,
+            additionalContext: [String: any Sendable]?,
+            component: String = "CoreAIExecutor"
+        ) throws -> [Int] {
             do {
                 CLILogger.log("Applying chat template via tokenizer", component: component)
-                return try tokenizer.applyChatTemplate(messages: messages, tools: toolSpecs)
+                return try tokenizer.applyChatTemplate(
+                    messages: messages,
+                    tools: tools,
+                    additionalContext: additionalContext)
             } catch {
+                guard additionalContext == nil else {
+                    throw LanguageModelError.unsupportedCapability(
+                        .init(
+                            capability: .reasoning,
+                            debugDescription:
+                                "This Core AI model's chat template could not honor the requested reasoning policy."))
+                }
                 CLILogger.log(
                     "Failed to apply chat template: \(error), falling back to simple encoding",
                     component: component)
@@ -764,11 +791,11 @@ public struct CoreAILanguageModel: LanguageModel {
             }
         }
 
-        private static func validateReasoning(
+        static func reasoningTemplateContext(
             _ level: ContextOptions.ReasoningLevel?,
             supportsReasoning: Bool
-        ) throws {
-            guard let level else { return }
+        ) throws -> [String: any Sendable]? {
+            guard let level else { return nil }
             switch level {
             case .light, .moderate, .deep:
                 guard supportsReasoning else {
@@ -777,9 +804,12 @@ public struct CoreAILanguageModel: LanguageModel {
                             capability: .reasoning,
                             debugDescription: "This Core AI model does not support reasoning."))
                 }
+                return nil
             case .custom(let value):
                 let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                if normalized == "no_think", !supportsReasoning { return }
+                if normalized == "no_think" {
+                    return supportsReasoning ? ["enable_thinking": false] : nil
+                }
                 throw LanguageModelError.unsupportedCapability(
                     .init(
                         capability: .reasoning,
