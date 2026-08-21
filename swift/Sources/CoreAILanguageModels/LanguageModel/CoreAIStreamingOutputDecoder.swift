@@ -349,12 +349,25 @@ package struct CoreAIStreamingOutputDecoder {
             case .header:
                 guard let match = scanner.firstSettledMatch(of: markers, isFinal: isFinal)
                 else {
-                    // A header is held whole; a partial one at the end of the
-                    // stream is a truncated envelope, not content.
+                    // A header is held whole, so whatever is buffered here is
+                    // everything generated since the last terminator — not "a
+                    // partial header". An artifact that stops emitting
+                    // envelopes buffers its entire run into this branch.
+                    //
+                    // There is no classified destination to flush it to: the
+                    // channel is exactly what the missing `<|message|>` would
+                    // have told us, and releasing unclassified bytes is how
+                    // raw protocol markers reach the caller as response text.
+                    // So this raises rather than flushing, and it raises
+                    // whether or not the caller cut generation short:
+                    // `truncated` must not short-circuit a check that a model
+                    // -chosen stop would still fire. Dropping the buffer made
+                    // a capped run report success with an empty response —
+                    // an empty pane and no error.
                     guard isFinal else { return events }
                     let remainder = scanner.takeAll()
                         .trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !remainder.isEmpty, !truncated { throw failure(.malformedChannel) }
+                    if !remainder.isEmpty { throw failure(.malformedChannel) }
                     return events
                 }
                 let target = try classify(header: scanner.takeUpTo(match.range))

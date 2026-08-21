@@ -97,14 +97,45 @@ struct DecoderTruncationTests {
         }
     }
 
-    @Test("A capped generation accepts a half-written envelope header")
-    func envelopeTruncationAcceptsPartialHeader() throws {
+    // A header is held whole, so what sits in the buffer during the header
+    // phase is not "a partial header" — it is everything generated since the
+    // last terminator, with no bound. Dropping it on truncation handed the
+    // caller a successful, empty response: an empty pane and no error. There
+    // is no classified destination to flush it to either, because the channel
+    // is precisely what the missing `<|message|>` would have named, so this
+    // path raises instead. `truncated` does not excuse it.
+
+    @Test("A capped generation cut mid-header reports the failure instead of dropping it")
+    func envelopeTruncationOnPartialHeaderFails() throws {
         var decoder = CoreAIStreamingOutputDecoder(profile: .harmony, reasoningEnabled: true)
-        var events = try decoder.consume("<|start|>assistant<|channel|>ana")
+        _ = try decoder.consume("<|start|>assistant<|channel|>ana")
+        #expect(throws: CoreAIProtocolError(profile: .harmony, failure: .malformedChannel)) {
+            _ = try decoder.finish(truncated: true)
+        }
+    }
+
+    @Test("A capped run that never emits an envelope cannot report an empty success")
+    func envelopeTruncationOnLargeBufferFails() throws {
+        var decoder = CoreAIStreamingOutputDecoder(profile: .harmony, reasoningEnabled: true)
+        // An artifact that stops emitting envelopes buffers its whole run
+        // here. This is the case the 30-character fixture above understates.
+        let run = String(repeating: "synthetic-finding ", count: 200)
+        let streamed = try decoder.consume(run)
+        #expect(streamed.isEmpty, "unclassified bytes must not reach the caller")
+        #expect(throws: CoreAIProtocolError(profile: .harmony, failure: .malformedChannel)) {
+            _ = try decoder.finish(truncated: true)
+        }
+    }
+
+    @Test("A capped run that ends on a terminator still succeeds")
+    func envelopeTruncationAtACleanBoundarySucceeds() throws {
+        var decoder = CoreAIStreamingOutputDecoder(profile: .harmony, reasoningEnabled: true)
+        var events = try decoder.consume(
+            "<|start|>assistant<|channel|>final<|message|>partial answer<|return|>")
         events += try decoder.finish(truncated: true)
-        // A header is protocol, never content, so nothing is emitted — but
-        // being cut off mid-header is not a violation either.
-        #expect(events.isEmpty)
+        // Nothing is buffered when the cap lands on an envelope boundary, so
+        // the stricter rule above must not fire here.
+        #expect(responseText(events) == "partial answer")
     }
 
     @Test("The same half-written header at end-of-turn is still a violation")
