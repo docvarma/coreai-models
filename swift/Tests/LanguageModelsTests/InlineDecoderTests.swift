@@ -225,10 +225,20 @@ struct InlineDecoderTests {
         // A header carries no content, so classifying it emits nothing.
         let early = try decoder.consume("<|start|>assistant<|channel|>analysis<|message|>")
         #expect(early.isEmpty)
+        // Asserted per call, not accumulated: a decoder that emitted nothing
+        // until `finish()` would satisfy the totals but fail right here.
         var events = try decoder.consume("synthetic-reasoning<|end|>")
-        events += try decoder.consume("<|start|>assistant<|channel|>final<|message|>")
-        events += try decoder.consume("synthetic-response<|return|>")
-        events += try decoder.finish()
+        #expect(events == [.reasoning("synthetic-reasoning")])
+        let betweenEnvelopes = try decoder.consume(
+            "<|start|>assistant<|channel|>final<|message|>")
+        #expect(betweenEnvelopes.isEmpty)
+        events += betweenEnvelopes
+        let responseEvents = try decoder.consume("synthetic-response<|return|>")
+        #expect(responseEvents == [.response("synthetic-response")])
+        events += responseEvents
+        let trailing = try decoder.finish()
+        #expect(trailing.isEmpty, "every envelope closed before the stream ended")
+        events += trailing
         #expect(events == [.reasoning("synthetic-reasoning"), .response("synthetic-response")])
     }
 }

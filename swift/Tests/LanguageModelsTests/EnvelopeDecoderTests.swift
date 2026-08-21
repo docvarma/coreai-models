@@ -66,6 +66,15 @@ struct EnvelopeDecoderTests {
         #expect(events == [.response("the ans")])
     }
 
+    @Test("ATEM user body streams before its terminator arrives")
+    func atemUserBodyStreamsEarly() throws {
+        var decoder = CoreAIStreamingOutputDecoder(profile: .atem, reasoningEnabled: true)
+        _ = try decoder.consume("<|start|>assistant to=self<|message|>thinking<|eom|>")
+        _ = try decoder.consume("<|start|>assistant to=user<|message|>")
+        let events = try decoder.consume("do")
+        #expect(events == [.response("do")], "the body must not wait for <|eot|>")
+    }
+
     @Test("Analysis channel routes to reasoning")
     func analysisRoutesToReasoning() throws {
         let events = try drain(profile: .harmony, reasoningEnabled: true, deltas: [harmonyWhole])
@@ -140,6 +149,23 @@ struct EnvelopeDecoderTests {
     func harmonyToolCallEmittedWhenComplete() throws {
         let events = try drain(
             profile: .harmony, reasoningEnabled: false, deltas: [harmonyToolWhole])
+        #expect(
+            events == [
+                .toolCall(
+                    id: "coreai-call-1", name: "synthetic.tool", argumentsJSON: "{\"value\":1}")
+            ])
+    }
+
+    @Test("A tool body split across deltas reassembles into one call")
+    func toolBodySplitAcrossDeltasReassembles() throws {
+        var decoder = CoreAIStreamingOutputDecoder(profile: .harmony, reasoningEnabled: false)
+        var events = try decoder.consume(
+            "<|start|>assistant to=functions.synthetic.tool<|channel|>commentary<|message|>")
+        events += try decoder.consume("{\"value\"")
+        events += try decoder.consume(":1")
+        #expect(events.isEmpty, "no fragment of the body may be dispatched")
+        events += try decoder.consume("}<|call|>")
+        events += try decoder.finish()
         #expect(
             events == [
                 .toolCall(
