@@ -92,6 +92,17 @@ struct InlineDecoderTests {
         }
     }
 
+    @Test("Unclosed tool block fails at finish")
+    func unclosedToolCallFails() {
+        #expect(
+            throws: CoreAIProtocolError(profile: .qwen35XML, failure: .unfinishedToolCall)
+        ) {
+            try drain(
+                profile: .qwen35XML, reasoningEnabled: false,
+                deltas: ["<tool_call><function=synthetic.tool><parameter=value>1"])
+        }
+    }
+
     @Test("Reasoning while disabled is a failure")
     func reasoningWhileDisabledFails() {
         #expect(throws: CoreAIProtocolError.self) {
@@ -208,14 +219,16 @@ struct InlineDecoderTests {
             ])
     }
 
-    @Test("Envelope profiles still decode at finish")
-    func envelopeProfilesDecodeAtFinish() throws {
+    @Test("Envelope profiles stream each body once its header is classified")
+    func envelopeProfilesStreamPerEnvelope() throws {
         var decoder = CoreAIStreamingOutputDecoder(profile: .harmony, reasoningEnabled: true)
+        // A header carries no content, so classifying it emits nothing.
         let early = try decoder.consume("<|start|>assistant<|channel|>analysis<|message|>")
         #expect(early.isEmpty)
-        _ = try decoder.consume("synthetic-reasoning<|end|>")
-        _ = try decoder.consume("<|start|>assistant<|channel|>final<|message|>")
-        let events = try decoder.consume("synthetic-response<|return|>") + (try decoder.finish())
+        var events = try decoder.consume("synthetic-reasoning<|end|>")
+        events += try decoder.consume("<|start|>assistant<|channel|>final<|message|>")
+        events += try decoder.consume("synthetic-response<|return|>")
+        events += try decoder.finish()
         #expect(events == [.reasoning("synthetic-reasoning"), .response("synthetic-response")])
     }
 }

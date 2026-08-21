@@ -49,6 +49,14 @@ package struct MarkerScanner {
     /// next delta may turn it into `<|tool_call>call:`. Acting on the shorter
     /// spelling there would reject a well-formed call. Withholding is bounded —
     /// `takeSafe` holds the same bytes back, and `isFinal` settles everything.
+    ///
+    /// Known limitation: growth is only tested from the match's own start, so
+    /// a marker occurring at a *nonzero* offset inside a longer marker would
+    /// be acted on early. That is latent, not live: no marker in any profile
+    /// vocabulary — inline blocks, envelope headers, envelope terminators, or
+    /// the full reserved set `plainChat` watches — is a substring of another
+    /// at a nonzero offset. A future marker that broke that would need this
+    /// check widened to every start index, not a note.
     package func firstSettledMatch(
         of markers: [String],
         isFinal: Bool

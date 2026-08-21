@@ -11,8 +11,11 @@ import Foundation
 /// text at top level, so text is released as soon as it can no longer be part
 /// of a pending structural marker. A tool block is the exception: it is
 /// withheld until its closing marker arrives, because a structurally
-/// incomplete call cannot be dispatched. Envelope profiles (`harmony`, `atem`)
-/// are still decoded whole at native termination.
+/// incomplete call cannot be dispatched. Envelope profiles (`harmony`,
+/// `atem`) carry no top-level text at all: every message is wrapped in a
+/// `<|start|>assistant…<|message|>BODY<terminator>` envelope, so a header is
+/// held whole, classified once complete, and its body then streams — or, for
+/// a tool recipient, buffers — until the envelope terminates.
 package struct CoreAIStreamingOutputDecoder {
     package enum Event: Equatable, Sendable {
         case response(String)
@@ -44,6 +47,9 @@ package struct CoreAIStreamingOutputDecoder {
     private var sawReasoning = false
     private var trimLeadingReasoningNewline = false
     private var toolCallIndex = 0
+    private var envelopePhase: EnvelopePhase = .header
+    private var sawResponseEnvelope = false
+    private var sawToolEnvelope = false
 
     private var mode: Mode {
         switch profile {
@@ -235,18 +241,236 @@ package struct CoreAIStreamingOutputDecoder {
         }
     }
 
+    // MARK: - Envelope marker vocabulary
+
+    /// Where the body of the envelope currently open is routed.
+    private enum Destination: Equatable {
+        case response
+        case reasoning
+        /// `harmony`: the body is the JSON argument object of one named call.
+        case toolArguments(name: String)
+        /// `atem`: the body is an `<atem:function_calls>` block that names its
+        /// own calls, so the header recipient carries no usable name.
+        case toolMarkup
+    }
+
+    private enum EnvelopePhase {
+        case header
+        case body(Destination)
+    }
+
+    /// Header terminator. Everything before it is protocol, never content.
+    private static let envelopeHeaderEnd = "<|message|>"
+
+    /// The terminators the batch parsers matched on, one set per profile.
+    private var envelopeTerminators: [String] {
+        switch profile {
+        case .harmony: ["<|end|>", "<|return|>", "<|call|>"]
+        case .atem: ["<|eom|>", "<|eot|>"]
+        case .plainChat, .qwen35XML, .gemma4Channels: []
+        }
+    }
+
+    /// One vocabulary per phase, driving both matching and hold-back so the
+    /// two cannot drift — the discipline `pendingMarkers` applies inline.
+    ///
+    /// Inside a buffered tool body only the terminators matter: that text
+    /// never reaches the caller, so marker-like bytes in tool arguments are
+    /// the block parser's business.
+    private var pendingEnvelopeMarkers: [String] {
+        switch envelopePhase {
+        case .header: [Self.envelopeHeaderEnd]
+        case .body: envelopeTerminators
+        }
+    }
+
     // MARK: - Envelope drain
 
-    /// TEMPORARY (Task 5): a shim that preserves the pre-existing whole-output
-    /// behavior of the envelope profiles. Task 6 replaces it with real
-    /// envelope streaming.
     private mutating func drainEnvelope(isFinal: Bool) throws -> [Event] {
-        guard isFinal else { return [] }
-        let whole = scanner.takeAll()
+        var events: [Event] = []
+        while true {
+            let markers = pendingEnvelopeMarkers
+            switch envelopePhase {
+            case .header:
+                guard let match = scanner.firstSettledMatch(of: markers, isFinal: isFinal)
+                else {
+                    // A header is held whole; a partial one at the end of the
+                    // stream is a truncated envelope, not content.
+                    guard isFinal else { return events }
+                    let remainder = scanner.takeAll()
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !remainder.isEmpty { throw failure(.malformedChannel) }
+                    return events
+                }
+                let target = try classify(header: scanner.takeUpTo(match.range))
+                try assertOrdered(target)
+                envelopePhase = .body(target)
+            case .body(let target):
+                if let match = scanner.firstSettledMatch(of: markers, isFinal: isFinal) {
+                    let body = scanner.takeUpTo(match.range)
+                    events += try flushBody(body, to: target, terminatedBy: match.marker)
+                    envelopePhase = .header
+                    continue
+                }
+                let safe = scanner.takeSafe(waitingFor: markers, isFinal: isFinal)
+                events += try flushBody(safe, to: target, terminatedBy: nil)
+                if isFinal { throw failure(unfinished(target)) }
+                return events
+            }
+        }
+    }
+
+    /// Classifies one complete envelope header, using the spellings the batch
+    /// parsers matched on: harmony puts the recipient *before* the channel
+    /// (`<|start|>assistant to=functions.NAME<|channel|>commentary`), atem puts
+    /// it directly after the role (`<|start|>assistant to=user`). A recipient
+    /// wins over a channel name. Anything else is a protocol violation rather
+    /// than text, so it is never streamed to the caller.
+    ///
+    /// Note the pipes on both sides of harmony's `<|channel|>`: `gemma4Channels`
+    /// spells its own channel marker `<|channel>`, and the two are different
+    /// markers.
+    private func classify(header rawHeader: String) throws -> Destination {
+        // Whitespace between envelopes belongs to no message.
+        let header = String(rawHeader.drop(while: { $0.isWhitespace }))
+        let role = "<|start|>assistant"
+        guard header.hasPrefix(role) else { throw failure(.malformedChannel) }
+        let remainder = String(header.dropFirst(role.count))
         switch profile {
-        case .harmony: return try parseHarmony(whole)
-        case .atem: return try parseATEM(whole)
-        case .plainChat, .qwen35XML, .gemma4Channels: return []
+        case .harmony:
+            if remainder == "<|channel|>analysis" { return try reasoningDestination() }
+            if remainder == "<|channel|>final" { return .response }
+            let recipient = " to=functions."
+            if remainder.hasPrefix(recipient),
+                let channel = remainder.range(of: "<|channel|>commentary")
+            {
+                let start = remainder.index(remainder.startIndex, offsetBy: recipient.count)
+                let name = String(remainder[start..<channel.lowerBound])
+                guard isValidName(name) else { throw failure(.malformedToolCall) }
+                return .toolArguments(name: name)
+            }
+            throw failure(.malformedChannel)
+        case .atem:
+            let recipient = " to="
+            guard remainder.hasPrefix(recipient) else { throw failure(.malformedChannel) }
+            switch String(remainder.dropFirst(recipient.count)) {
+            case "self": return try reasoningDestination()
+            case "user": return .response
+            default: return .toolMarkup
+            }
+        case .plainChat, .qwen35XML, .gemma4Channels:
+            throw failure(.malformedChannel)
+        }
+    }
+
+    /// Neither envelope profile can suppress reasoning in its template, so a
+    /// reasoning envelope under a disabled policy is caught here rather than
+    /// relabelled as response text.
+    private func reasoningDestination() throws -> Destination {
+        guard reasoningEnabled else { throw failure(.malformedReasoning) }
+        return .reasoning
+    }
+
+    /// Ordering rules carried over from the batch parsers: nothing follows the
+    /// response envelope, and reasoning never follows a tool call. Consecutive
+    /// tool envelopes are legal.
+    private func assertOrdered(_ destination: Destination) throws {
+        switch destination {
+        case .response:
+            if sawResponseEnvelope { throw failure(.duplicateProtocolBlock) }
+            if sawToolEnvelope { throw failure(.mixedResponseAndToolCall) }
+        case .reasoning:
+            if sawResponseEnvelope || sawToolEnvelope {
+                throw failure(.mixedResponseAndToolCall)
+            }
+        case .toolArguments, .toolMarkup:
+            if sawResponseEnvelope { throw failure(.mixedResponseAndToolCall) }
+        }
+    }
+
+    private mutating func flushBody(
+        _ text: String,
+        to destination: Destination,
+        terminatedBy terminator: String?
+    ) throws -> [Event] {
+        switch destination {
+        case .response, .reasoning:
+            var events: [Event] = []
+            if !text.isEmpty {
+                events.append(destination == .reasoning ? .reasoning(text) : .response(text))
+            }
+            if let terminator { try close(destination, terminatedBy: terminator) }
+            return events
+        case .toolArguments, .toolMarkup:
+            // A structurally incomplete call cannot be dispatched.
+            blockBuffer.append(text)
+            guard let terminator else { return [] }
+            try close(destination, terminatedBy: terminator)
+            let body = blockBuffer
+            blockBuffer = ""
+            let calls = try toolCalls(from: body, to: destination)
+            toolCallIndex += calls.count
+            return calls
+        }
+    }
+
+    /// Each recipient is paired with exactly one terminator; a wrong pairing
+    /// is a protocol violation, not a shorter message.
+    private func expectedTerminator(for destination: Destination) -> String? {
+        switch profile {
+        case .harmony:
+            switch destination {
+            case .reasoning: return "<|end|>"
+            case .response: return "<|return|>"
+            case .toolArguments: return "<|call|>"
+            case .toolMarkup: return nil
+            }
+        case .atem:
+            switch destination {
+            case .reasoning: return "<|eom|>"
+            case .response: return "<|eot|>"
+            case .toolArguments, .toolMarkup: return nil
+            }
+        case .plainChat, .qwen35XML, .gemma4Channels:
+            return nil
+        }
+    }
+
+    private mutating func close(
+        _ destination: Destination,
+        terminatedBy terminator: String
+    ) throws {
+        if let expected = expectedTerminator(for: destination), terminator != expected {
+            throw failure(.malformedChannel)
+        }
+        switch destination {
+        case .response: sawResponseEnvelope = true
+        case .reasoning: break
+        case .toolArguments, .toolMarkup: sawToolEnvelope = true
+        }
+    }
+
+    private func toolCalls(from body: String, to destination: Destination) throws -> [Event] {
+        switch destination {
+        case .toolArguments(let name):
+            return try jsonToolEvents(
+                from: "{\"name\":\"\(jsonEscape(name))\",\"arguments\":\(body)}",
+                startingAt: toolCallIndex)
+        case .toolMarkup:
+            return try parseATEMCalls(body, startingAt: toolCallIndex)
+        case .response, .reasoning:
+            throw failure(.malformedToolCall)
+        }
+    }
+
+    /// An envelope that never terminated. There is no response-specific
+    /// reason code, so a truncated response envelope reports the envelope
+    /// itself as malformed.
+    private func unfinished(_ destination: Destination) -> CoreAIProtocolFailure {
+        switch destination {
+        case .response: return .malformedChannel
+        case .reasoning: return .unfinishedReasoning
+        case .toolArguments, .toolMarkup: return .unfinishedToolCall
         }
     }
 
@@ -314,60 +538,6 @@ package struct CoreAIStreamingOutputDecoder {
         }
     }
 
-    // MARK: - Harmony
-
-    private func parseHarmony(_ original: String) throws -> [Event] {
-        var remainder = original.trimmingCharacters(in: .whitespacesAndNewlines)
-        var events: [Event] = []
-        var hasFinal = false
-        var hasTool = false
-        while !remainder.isEmpty {
-            guard remainder.hasPrefix("<|start|>assistant"),
-                let messageMarker = remainder.range(of: "<|message|>")
-            else { throw failure(.malformedChannel) }
-            let headerStart = remainder.index(
-                remainder.startIndex, offsetBy: "<|start|>assistant".count)
-            let header = String(remainder[headerStart..<messageMarker.lowerBound])
-            let bodyStart = messageMarker.upperBound
-            guard let termination = firstTermination(
-                in: remainder, after: bodyStart,
-                markers: ["<|end|>", "<|return|>", "<|call|>"])
-            else { throw failure(.malformedChannel) }
-            let body = String(remainder[bodyStart..<termination.range.lowerBound])
-
-            if header == "<|channel|>analysis" {
-                guard !hasFinal, !hasTool, termination.marker == "<|end|>" else {
-                    throw failure(.mixedResponseAndToolCall)
-                }
-                if !body.isEmpty { events.append(.reasoning(body)) }
-            } else if header == "<|channel|>final" {
-                guard !hasFinal, !hasTool, termination.marker == "<|return|>" else {
-                    throw failure(.duplicateProtocolBlock)
-                }
-                hasFinal = true
-                if !body.isEmpty { events.append(.response(body)) }
-            } else if header.hasPrefix(" to=functions."),
-                let channel = header.range(of: "<|channel|>commentary")
-            {
-                guard !hasFinal, termination.marker == "<|call|>" else {
-                    throw failure(.mixedResponseAndToolCall)
-                }
-                hasTool = true
-                let nameStart = header.index(header.startIndex, offsetBy: " to=functions.".count)
-                let name = String(header[nameStart..<channel.lowerBound])
-                let calls = try jsonToolEvents(
-                    from: "{\"name\":\"\(jsonEscape(name))\",\"arguments\":\(body)}",
-                    startingAt: events.toolCallCount)
-                events.append(contentsOf: calls)
-            } else {
-                throw failure(.malformedChannel)
-            }
-            remainder = String(remainder[termination.range.upperBound...])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return events
-    }
-
     // MARK: - Gemma 4
 
     private func parseGemmaCall(_ body: String, callIndex: Int) throws -> Event {
@@ -398,46 +568,6 @@ package struct CoreAIStreamingOutputDecoder {
     }
 
     // MARK: - ATEM
-
-    private func parseATEM(_ original: String) throws -> [Event] {
-        var remainder = original.trimmingCharacters(in: .whitespacesAndNewlines)
-        var events: [Event] = []
-        var hasFinal = false
-        var hasTool = false
-        while !remainder.isEmpty {
-            let prefix = "<|start|>assistant to="
-            guard remainder.hasPrefix(prefix),
-                let messageMarker = remainder.range(of: "<|message|>")
-            else { throw failure(.malformedChannel) }
-            let recipientStart = remainder.index(remainder.startIndex, offsetBy: prefix.count)
-            let recipient = String(remainder[recipientStart..<messageMarker.lowerBound])
-            guard let termination = firstTermination(
-                in: remainder, after: messageMarker.upperBound,
-                markers: ["<|eom|>", "<|eot|>"])
-            else { throw failure(.malformedChannel) }
-            let body = String(remainder[messageMarker.upperBound..<termination.range.lowerBound])
-            switch recipient {
-            case "self":
-                guard !hasFinal, !hasTool, termination.marker == "<|eom|>" else {
-                    throw failure(.mixedResponseAndToolCall)
-                }
-                if !body.isEmpty { events.append(.reasoning(body)) }
-            case "user":
-                guard !hasFinal, !hasTool, termination.marker == "<|eot|>" else {
-                    throw failure(.duplicateProtocolBlock)
-                }
-                hasFinal = true
-                if !body.isEmpty { events.append(.response(body)) }
-            default:
-                guard !hasFinal else { throw failure(.mixedResponseAndToolCall) }
-                hasTool = true
-                events.append(contentsOf: try parseATEMCalls(body, startingAt: events.toolCallCount))
-            }
-            remainder = String(remainder[termination.range.upperBound...])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return events
-    }
 
     private func parseATEMCalls(_ body: String, startingAt start: Int) throws -> [Event] {
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -511,16 +641,6 @@ package struct CoreAIStreamingOutputDecoder {
         return value
     }
 
-    private func firstTermination(
-        in text: String,
-        after start: String.Index,
-        markers: [String]
-    ) -> (marker: String, range: Range<String.Index>)? {
-        markers.compactMap { marker in
-            text.range(of: marker, range: start..<text.endIndex).map { (marker, $0) }
-        }.min { $0.1.lowerBound < $1.1.lowerBound }
-    }
-
     private func splitTopLevel(
         _ text: String,
         separator: Character,
@@ -560,13 +680,5 @@ package struct CoreAIStreamingOutputDecoder {
 
     private func failure(_ reason: CoreAIProtocolFailure) -> CoreAIProtocolError {
         CoreAIProtocolError(profile: profile, failure: reason)
-    }
-}
-
-private extension Array where Element == CoreAIStreamingOutputDecoder.Event {
-    var toolCallCount: Int {
-        reduce(into: 0) { count, event in
-            if case .toolCall = event { count += 1 }
-        }
     }
 }
