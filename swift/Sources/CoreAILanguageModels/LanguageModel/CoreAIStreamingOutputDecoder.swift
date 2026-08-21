@@ -7,10 +7,12 @@ import Foundation
 
 /// Strict decoder shared by the Core AI text and vision adapters.
 ///
-/// Generated deltas are retained until native termination so a later malformed,
-/// nested, duplicate, or mixed protocol block can fail before content is
-/// committed to a FoundationModels transcript. This also makes every reserved
-/// marker safe when split at any streaming boundary.
+/// Inline profiles (`plainChat`, `qwen35XML`, `gemma4Channels`) carry response
+/// text at top level, so text is released as soon as it can no longer be part
+/// of a pending structural marker. A tool block is the exception: it is
+/// withheld until its closing marker arrives, because a structurally
+/// incomplete call cannot be dispatched. Envelope profiles (`harmony`, `atem`)
+/// are still decoded whole at native termination.
 package struct CoreAIStreamingOutputDecoder {
     package enum Event: Equatable, Sendable {
         case response(String)
@@ -18,9 +20,38 @@ package struct CoreAIStreamingOutputDecoder {
         case toolCall(id: String, name: String, argumentsJSON: String)
     }
 
+    private enum Mode {
+        /// Response text at top level, reasoning and tool blocks inline.
+        case inline
+        /// Whole output is a sequence of channel-message envelopes.
+        case envelope
+    }
+
+    private enum State {
+        case text
+        case reasoning
+        case toolBlock
+        /// A tool body that opened without its wrapping block marker. Its text
+        /// is swallowed rather than passed off as a response, and the stream
+        /// fails at termination.
+        case strayToolBlock
+    }
+
     private let profile: CoreAILanguageProtocolProfile
     private let reasoningEnabled: Bool
-    private var buffer = ""
+    private var scanner = MarkerScanner()
+    private var state: State = .text
+    private var blockBuffer = ""
+    private var sawReasoning = false
+    private var trimLeadingReasoningNewline = false
+    private var toolCallIndex = 0
+
+    private var mode: Mode {
+        switch profile {
+        case .plainChat, .qwen35XML, .gemma4Channels: .inline
+        case .harmony, .atem: .envelope
+        }
+    }
 
     package init(
         profile: CoreAILanguageProtocolProfile,
@@ -31,82 +62,201 @@ package struct CoreAIStreamingOutputDecoder {
     }
 
     package mutating func consume(_ delta: String) throws -> [Event] {
-        buffer.append(delta)
-        return []
+        scanner.append(delta)
+        switch mode {
+        case .inline: return try drainInline(isFinal: false)
+        case .envelope: return try drainEnvelope(isFinal: false)
+        }
     }
 
     package mutating func finish() throws -> [Event] {
-        defer { buffer.removeAll(keepingCapacity: false) }
-        switch profile {
-        case .plainChat:
-            return try parsePlain(buffer)
-        case .qwen35XML:
-            return try parseQwenXML(buffer)
-        case .harmony:
-            return try parseHarmony(buffer)
-        case .gemma4Channels:
-            return try parseGemma(buffer)
-        case .atem:
-            return try parseATEM(buffer)
+        switch mode {
+        case .inline: return try drainInline(isFinal: true)
+        case .envelope: return try drainEnvelope(isFinal: true)
         }
     }
 
-    // MARK: - Plain profiles
+    // MARK: - Inline marker vocabulary
 
-    private func parsePlain(_ text: String) throws -> [Event] {
+    /// Marker that opens a reasoning block. Deliberately *not* gated on the
+    /// reasoning policy: a disabled model that reasons anyway must be caught,
+    /// not streamed to the caller as response text.
+    private var reasoningOpen: String? {
+        switch profile {
+        case .qwen35XML: "<think>"
+        case .gemma4Channels: "<|channel>thought"
+        case .plainChat, .harmony, .atem: nil
+        }
+    }
+
+    private var reasoningClose: String? {
+        switch profile {
+        case .qwen35XML: "</think>"
+        case .gemma4Channels: "<channel|>"
+        case .plainChat, .harmony, .atem: nil
+        }
+    }
+
+    /// For `qwen35XML` this is the *outer* pair; the body handed to the block
+    /// parser begins with `<function=`, which `parseQwenXMLCall` reads itself.
+    private var toolOpen: String? {
+        switch profile {
+        case .qwen35XML: "<tool_call>"
+        case .gemma4Channels: "<|tool_call>call:"
+        case .plainChat, .harmony, .atem: nil
+        }
+    }
+
+    private var toolClose: String? {
+        switch profile {
+        case .qwen35XML: "</tool_call>"
+        case .gemma4Channels: "<tool_call|>"
+        case .plainChat, .harmony, .atem: nil
+        }
+    }
+
+    /// Inner tool marker that is only legal inside `toolOpen`. Seeing it at top
+    /// level means a malformed call, which must be withheld rather than
+    /// streamed as response text.
+    private var strayToolOpen: String? {
+        switch profile {
+        case .qwen35XML: "<function="
+        case .plainChat, .gemma4Channels, .harmony, .atem: nil
+        }
+    }
+
+    /// Markers that change state when matched in the current state.
+    private var pendingMarkers: [String] {
+        switch state {
+        case .text: [reasoningOpen, reasoningClose, toolOpen, strayToolOpen].compactMap { $0 }
+        case .reasoning: [reasoningClose, reasoningOpen].compactMap { $0 }
+        case .toolBlock: [toolClose].compactMap { $0 }
+        case .strayToolBlock: []
+        }
+    }
+
+    /// Markers whose partial suffix must be withheld from the caller. Equal to
+    /// `pendingMarkers` except for `plainChat`, which has no structural markers
+    /// of its own yet must never let a reserved marker through split across two
+    /// deltas.
+    private var holdBackMarkers: [String] {
+        let pending = pendingMarkers
+        guard pending.isEmpty else { return pending }
+        if profile == .plainChat, state == .text { return CoreAITranscriptCodec.reservedMarkers }
+        return []
+    }
+
+    // MARK: - Inline drain
+
+    private mutating func drainInline(isFinal: Bool) throws -> [Event] {
+        var events: [Event] = []
+        while true {
+            if let match = scanner.firstMatch(of: pendingMarkers) {
+                let before = scanner.takeUpTo(match.range)
+                events += try emit(before)
+                try transition(on: match.marker, into: &events)
+                continue
+            }
+            let safe = scanner.takeSafe(waitingFor: holdBackMarkers, isFinal: isFinal)
+            events += try emit(safe)
+            if isFinal { try assertClosed() }
+            return events
+        }
+    }
+
+    private mutating func emit(_ text: String) throws -> [Event] {
+        guard !text.isEmpty else { return [] }
+        switch state {
+        case .text:
+            try rejectReservedMarkers(in: text)
+            return [.response(text)]
+        case .reasoning:
+            var body = text
+            if trimLeadingReasoningNewline {
+                trimLeadingReasoningNewline = false
+                if body.hasPrefix("\n") { body.removeFirst() }
+            }
+            return body.isEmpty ? [] : [.reasoning(body)]
+        case .toolBlock, .strayToolBlock:
+            blockBuffer.append(text)
+            return []
+        }
+    }
+
+    private mutating func transition(on marker: String, into events: inout [Event]) throws {
+        if marker == reasoningOpen {
+            guard reasoningEnabled else { throw failure(.malformedReasoning) }
+            guard state != .reasoning else { throw failure(.nestedProtocolBlock) }
+            guard !sawReasoning else { throw failure(.duplicateProtocolBlock) }
+            guard state == .text else { throw failure(.nestedProtocolBlock) }
+            sawReasoning = true
+            trimLeadingReasoningNewline = true
+            state = .reasoning
+        } else if marker == reasoningClose {
+            guard state == .reasoning else {
+                throw failure(sawReasoning ? .duplicateProtocolBlock : .malformedReasoning)
+            }
+            state = .text
+        } else if marker == toolOpen {
+            guard state == .text else { throw failure(.nestedProtocolBlock) }
+            blockBuffer = ""
+            state = .toolBlock
+        } else if marker == toolClose {
+            guard state == .toolBlock else { throw failure(.malformedToolCall) }
+            events.append(try parseToolBlock(blockBuffer, index: toolCallIndex))
+            toolCallIndex += 1
+            blockBuffer = ""
+            state = .text
+        } else if marker == strayToolOpen {
+            guard state == .text else { throw failure(.nestedProtocolBlock) }
+            blockBuffer = ""
+            state = .strayToolBlock
+        }
+    }
+
+    private func assertClosed() throws {
+        switch state {
+        case .text: return
+        case .reasoning: throw failure(.unfinishedReasoning)
+        case .toolBlock: throw failure(.unfinishedToolCall)
+        case .strayToolBlock: throw failure(.malformedToolCall)
+        }
+    }
+
+    /// Guards against a structural marker appearing in what should be plain
+    /// response text — the `plainChat`-on-a-reasoning-model case.
+    private func rejectReservedMarkers(in text: String) throws {
+        guard profile == .plainChat else { return }
         guard !CoreAITranscriptCodec.reservedMarkers.contains(where: text.contains) else {
             throw failure(.malformedChannel)
         }
-        return text.isEmpty ? [] : [.response(text)]
+    }
+
+    /// One structurally complete tool block, without its delimiting markers.
+    private func parseToolBlock(_ body: String, index: Int) throws -> Event {
+        switch profile {
+        case .qwen35XML: return try parseQwenXMLCall(body, callIndex: index)
+        case .gemma4Channels: return try parseGemmaCall(body, callIndex: index)
+        case .plainChat, .harmony, .atem: throw failure(.malformedToolCall)
+        }
+    }
+
+    // MARK: - Envelope drain
+
+    /// TEMPORARY (Task 5): a shim that preserves the pre-existing whole-output
+    /// behavior of the envelope profiles. Task 6 replaces it with real
+    /// envelope streaming.
+    private mutating func drainEnvelope(isFinal: Bool) throws -> [Event] {
+        guard isFinal else { return [] }
+        let whole = scanner.takeAll()
+        switch profile {
+        case .harmony: return try parseHarmony(whole)
+        case .atem: return try parseATEM(whole)
+        case .plainChat, .qwen35XML, .gemma4Channels: return []
+        }
     }
 
     // MARK: - Qwen
-
-    private func parseQwenXML(_ original: String) throws -> [Event] {
-        var text = original
-        var events: [Event] = []
-        if reasoningEnabled {
-            if text.hasPrefix("<think>\n") { text.removeFirst("<think>\n".count) }
-            else if text.hasPrefix("<think>") { text.removeFirst("<think>".count) }
-            guard let close = text.range(of: "</think>") else {
-                throw failure(.unfinishedReasoning)
-            }
-            let reasoning = String(text[..<close.lowerBound])
-            guard !reasoning.contains("<think>") else { throw failure(.nestedProtocolBlock) }
-            if !reasoning.isEmpty { events.append(.reasoning(reasoning)) }
-            text = String(text[close.upperBound...])
-            guard !text.contains("<think>"), !text.contains("</think>") else {
-                throw failure(.duplicateProtocolBlock)
-            }
-        } else if text.contains("<think>") || text.contains("</think>") {
-            throw failure(.malformedReasoning)
-        }
-
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.contains("<tool_call>") else {
-            return events + (text.isEmpty ? [] : [.response(text)])
-        }
-        guard text.replacingOccurrences(of: "<tool_call>", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .hasPrefix("<function=")
-        else { throw failure(.mixedResponseAndToolCall) }
-
-        var remainder = trimmed
-        var callIndex = 0
-        while !remainder.isEmpty {
-            guard remainder.hasPrefix("<tool_call>"),
-                let close = remainder.range(of: "</tool_call>")
-            else { throw failure(.unfinishedToolCall) }
-            let bodyStart = remainder.index(remainder.startIndex, offsetBy: "<tool_call>".count)
-            let body = String(remainder[bodyStart..<close.lowerBound])
-            let call = try parseQwenXMLCall(body, callIndex: callIndex)
-            events.append(call)
-            callIndex += 1
-            remainder = String(remainder[close.upperBound...])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return events
-    }
 
     private func parseQwenXMLCall(_ body: String, callIndex: Int) throws -> Event {
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -226,53 +376,13 @@ package struct CoreAIStreamingOutputDecoder {
 
     // MARK: - Gemma 4
 
-    private func parseGemma(_ original: String) throws -> [Event] {
-        var text = original
-        var events: [Event] = []
-        if reasoningEnabled {
-            let open = "<|channel>thought\n"
-            guard text.hasPrefix(open), let close = text.range(of: "<channel|>") else {
-                throw failure(.unfinishedReasoning)
-            }
-            let start = text.index(text.startIndex, offsetBy: open.count)
-            let reasoning = String(text[start..<close.lowerBound])
-            if !reasoning.isEmpty { events.append(.reasoning(reasoning)) }
-            text = String(text[close.upperBound...])
-        } else if text.contains("<|channel>thought") || text.contains("<channel|>") {
-            throw failure(.malformedReasoning)
+    private func parseGemmaCall(_ body: String, callIndex: Int) throws -> Event {
+        guard let brace = body.firstIndex(of: "{"), body.hasSuffix("}") else {
+            throw failure(.malformedToolCall)
         }
-        guard !text.contains("<|channel>thought"), !text.contains("<channel|>") else {
-            throw failure(.duplicateProtocolBlock)
-        }
-
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.contains("<|tool_call>") else {
-            return events + (text.isEmpty ? [] : [.response(text)])
-        }
-        guard trimmed.hasPrefix("<|tool_call>") else {
-            throw failure(.mixedResponseAndToolCall)
-        }
-        var remainder = trimmed
-        var callIndex = 0
-        while !remainder.isEmpty {
-            let open = "<|tool_call>call:"
-            guard remainder.hasPrefix(open),
-                let close = remainder.range(of: "<tool_call|>")
-            else { throw failure(.unfinishedToolCall) }
-            let start = remainder.index(remainder.startIndex, offsetBy: open.count)
-            let call = String(remainder[start..<close.lowerBound])
-            guard let brace = call.firstIndex(of: "{"), call.hasSuffix("}") else {
-                throw failure(.malformedToolCall)
-            }
-            let name = String(call[..<brace])
-            let argumentText = String(call[brace...])
-            let arguments = try parseGemmaArguments(argumentText)
-            events.append(try toolEvent(name: name, arguments: arguments, index: callIndex))
-            callIndex += 1
-            remainder = String(remainder[close.upperBound...])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return events
+        let name = String(body[..<brace])
+        let arguments = try parseGemmaArguments(String(body[brace...]))
+        return try toolEvent(name: name, arguments: arguments, index: callIndex)
     }
 
     private func parseGemmaArguments(_ text: String) throws -> [String: Any] {
