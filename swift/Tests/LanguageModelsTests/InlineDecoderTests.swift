@@ -117,8 +117,64 @@ struct InlineDecoderTests {
     func toolCallBuffersUntilComplete() throws {
         var decoder = CoreAIStreamingOutputDecoder(
             profile: .qwen35XML, reasoningEnabled: false)
-        let partial = try decoder.consume("<function=synthetic.tool><parameter=value>1")
+        let partial = try decoder.consume("<tool_call><function=synthetic.tool><parameter=value>1")
         #expect(partial.isEmpty, "a partial tool call must not be dispatched")
+    }
+
+    @Test("A top-level marker of the selected profile never reaches the caller")
+    func misplacedProfileMarkerFails() {
+        // Each case is split mid-marker so hold-back has to reassemble it
+        // before the violation can be seen at all.
+        let cases:
+            [(
+                profile: CoreAILanguageProtocolProfile, reasoning: Bool, deltas: [String],
+                failure: CoreAIProtocolFailure
+            )] = [
+                (.gemma4Channels, false, ["answer <|tool_", "call>oops"], .malformedToolCall),
+                (.gemma4Channels, false, ["answer <tool_c", "all|> more"], .malformedToolCall),
+                (.gemma4Channels, false, ["answer <|chan", "nel>final"], .malformedChannel),
+                (.qwen35XML, false, ["answer </tool_", "call> more"], .malformedToolCall),
+                (.qwen35XML, true, ["<think>why</think>ok </thi", "nk> more"], .duplicateProtocolBlock),
+            ]
+        for testCase in cases {
+            #expect(
+                throws: CoreAIProtocolError(
+                    profile: testCase.profile, failure: testCase.failure)
+            ) {
+                try drain(
+                    profile: testCase.profile, reasoningEnabled: testCase.reasoning,
+                    deltas: testCase.deltas)
+            }
+        }
+    }
+
+    @Test("A profile marker misplaced inside reasoning fails too")
+    func misplacedMarkerInsideReasoningFails() {
+        #expect(
+            throws: CoreAIProtocolError(profile: .qwen35XML, failure: .malformedToolCall)
+        ) {
+            try drain(
+                profile: .qwen35XML, reasoningEnabled: true,
+                deltas: ["<think>weighing </tool_", "call> options</think>ok"])
+        }
+    }
+
+    @Test("A looser delimiter spelling is held back until its longer form settles")
+    func longerDelimiterSpellingWins() throws {
+        // `<|tool_call>` alone is a violation, but it is also a prefix of the
+        // real opener, so it must not be acted on until the next delta lands.
+        var decoder = CoreAIStreamingOutputDecoder(
+            profile: .gemma4Channels, reasoningEnabled: false)
+        let held = try decoder.consume("<|tool_call>")
+        #expect(held.isEmpty)
+        let events =
+            try decoder.consume("call:synthetic.tool{value: 1}<tool_call|>")
+            + (try decoder.finish())
+        #expect(
+            events == [
+                .toolCall(
+                    id: "coreai-call-1", name: "synthetic.tool", argumentsJSON: "{\"value\":1}")
+            ])
     }
 
     @Test("Complete qwen tool block is emitted at its closing marker")

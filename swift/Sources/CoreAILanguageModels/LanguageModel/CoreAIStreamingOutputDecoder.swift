@@ -31,10 +31,6 @@ package struct CoreAIStreamingOutputDecoder {
         case text
         case reasoning
         case toolBlock
-        /// A tool body that opened without its wrapping block marker. Its text
-        /// is swallowed rather than passed off as a response, and the stream
-        /// fails at termination.
-        case strayToolBlock
     }
 
     private let profile: CoreAILanguageProtocolProfile
@@ -42,6 +38,9 @@ package struct CoreAIStreamingOutputDecoder {
     private var scanner = MarkerScanner()
     private var state: State = .text
     private var blockBuffer = ""
+    /// Load-bearing: a second reasoning block is rejected outright. That is the
+    /// only reason a `trimLeadingReasoningNewline` left set by an empty
+    /// reasoning block can never be applied to a later one.
     private var sawReasoning = false
     private var trimLeadingReasoningNewline = false
     private var toolCallIndex = 0
@@ -115,35 +114,41 @@ package struct CoreAIStreamingOutputDecoder {
         }
     }
 
-    /// Inner tool marker that is only legal inside `toolOpen`. Seeing it at top
-    /// level means a malformed call, which must be withheld rather than
-    /// streamed as response text.
-    private var strayToolOpen: String? {
+    /// Reserved markers that belong to this profile's protocol but never form
+    /// a transition: looser spellings of a block delimiter, and — for
+    /// `plainChat`, which has no protocol of its own — every reserved marker.
+    /// Seeing one where text is being streamed is a protocol violation, never
+    /// content, so each carries the failure it raises.
+    private var strayProfileMarkers: [(marker: String, failure: CoreAIProtocolFailure)] {
         switch profile {
-        case .qwen35XML: "<function="
-        case .plainChat, .gemma4Channels, .harmony, .atem: nil
+        case .plainChat:
+            CoreAITranscriptCodec.reservedMarkers.map { ($0, .malformedChannel) }
+        case .qwen35XML:
+            []
+        case .gemma4Channels:
+            [("<|channel>", .malformedChannel), ("<|tool_call>", .malformedToolCall)]
+        case .harmony, .atem:
+            []
         }
     }
 
-    /// Markers that change state when matched in the current state.
+    /// Markers the scanner watches in the current state. In a state whose text
+    /// reaches the caller this is the profile's whole vocabulary, not just the
+    /// markers that advance the state machine: a delimiter in the wrong
+    /// position must raise a typed failure rather than stream out as response
+    /// or reasoning text. `transition(on:into:)` sorts legal from illegal.
+    ///
+    /// Inside a tool block only the closing delimiter matters — that text is
+    /// buffered for the block parser and never reaches the caller, so a
+    /// marker-like byte in a tool argument is the block parser's business.
     private var pendingMarkers: [String] {
         switch state {
-        case .text: [reasoningOpen, reasoningClose, toolOpen, strayToolOpen].compactMap { $0 }
-        case .reasoning: [reasoningClose, reasoningOpen].compactMap { $0 }
-        case .toolBlock: [toolClose].compactMap { $0 }
-        case .strayToolBlock: []
+        case .text, .reasoning:
+            [reasoningOpen, reasoningClose, toolOpen, toolClose].compactMap { $0 }
+                + strayProfileMarkers.map(\.marker)
+        case .toolBlock:
+            [toolClose].compactMap { $0 }
         }
-    }
-
-    /// Markers whose partial suffix must be withheld from the caller. Equal to
-    /// `pendingMarkers` except for `plainChat`, which has no structural markers
-    /// of its own yet must never let a reserved marker through split across two
-    /// deltas.
-    private var holdBackMarkers: [String] {
-        let pending = pendingMarkers
-        guard pending.isEmpty else { return pending }
-        if profile == .plainChat, state == .text { return CoreAITranscriptCodec.reservedMarkers }
-        return []
     }
 
     // MARK: - Inline drain
@@ -151,13 +156,14 @@ package struct CoreAIStreamingOutputDecoder {
     private mutating func drainInline(isFinal: Bool) throws -> [Event] {
         var events: [Event] = []
         while true {
-            if let match = scanner.firstMatch(of: pendingMarkers) {
+            let markers = pendingMarkers
+            if let match = scanner.firstSettledMatch(of: markers, isFinal: isFinal) {
                 let before = scanner.takeUpTo(match.range)
                 events += try emit(before)
                 try transition(on: match.marker, into: &events)
                 continue
             }
-            let safe = scanner.takeSafe(waitingFor: holdBackMarkers, isFinal: isFinal)
+            let safe = scanner.takeSafe(waitingFor: markers, isFinal: isFinal)
             events += try emit(safe)
             if isFinal { try assertClosed() }
             return events
@@ -168,7 +174,6 @@ package struct CoreAIStreamingOutputDecoder {
         guard !text.isEmpty else { return [] }
         switch state {
         case .text:
-            try rejectReservedMarkers(in: text)
             return [.response(text)]
         case .reasoning:
             var body = text
@@ -177,7 +182,7 @@ package struct CoreAIStreamingOutputDecoder {
                 if body.hasPrefix("\n") { body.removeFirst() }
             }
             return body.isEmpty ? [] : [.reasoning(body)]
-        case .toolBlock, .strayToolBlock:
+        case .toolBlock:
             blockBuffer.append(text)
             return []
         }
@@ -188,7 +193,6 @@ package struct CoreAIStreamingOutputDecoder {
             guard reasoningEnabled else { throw failure(.malformedReasoning) }
             guard state != .reasoning else { throw failure(.nestedProtocolBlock) }
             guard !sawReasoning else { throw failure(.duplicateProtocolBlock) }
-            guard state == .text else { throw failure(.nestedProtocolBlock) }
             sawReasoning = true
             trimLeadingReasoningNewline = true
             state = .reasoning
@@ -207,10 +211,10 @@ package struct CoreAIStreamingOutputDecoder {
             toolCallIndex += 1
             blockBuffer = ""
             state = .text
-        } else if marker == strayToolOpen {
-            guard state == .text else { throw failure(.nestedProtocolBlock) }
-            blockBuffer = ""
-            state = .strayToolBlock
+        } else {
+            // A reserved spelling that never forms a transition anywhere.
+            throw failure(
+                strayProfileMarkers.first { $0.marker == marker }?.failure ?? .malformedChannel)
         }
     }
 
@@ -219,16 +223,6 @@ package struct CoreAIStreamingOutputDecoder {
         case .text: return
         case .reasoning: throw failure(.unfinishedReasoning)
         case .toolBlock: throw failure(.unfinishedToolCall)
-        case .strayToolBlock: throw failure(.malformedToolCall)
-        }
-    }
-
-    /// Guards against a structural marker appearing in what should be plain
-    /// response text — the `plainChat`-on-a-reasoning-model case.
-    private func rejectReservedMarkers(in text: String) throws {
-        guard profile == .plainChat else { return }
-        guard !CoreAITranscriptCodec.reservedMarkers.contains(where: text.contains) else {
-            throw failure(.malformedChannel)
         }
     }
 

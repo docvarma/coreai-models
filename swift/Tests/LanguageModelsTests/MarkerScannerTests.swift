@@ -36,6 +36,30 @@ struct MarkerScannerTests {
         #expect(scanner.takeSafe(waitingFor: ["<think>"], isFinal: true) == "<thi")
     }
 
+    @Test("A complete marker that a longer marker can still grow from is unsettled")
+    func settledMatchWaitsForLongerMarker() {
+        var scanner = MarkerScanner()
+        scanner.append("<|tool_call>")
+        let markers = ["<|tool_call>", "<|tool_call>call:"]
+        #expect(scanner.firstMatch(of: markers)?.marker == "<|tool_call>")
+        #expect(scanner.firstSettledMatch(of: markers, isFinal: false) == nil)
+        #expect(scanner.firstSettledMatch(of: markers, isFinal: true)?.marker == "<|tool_call>")
+    }
+
+    @Test("A settled match is returned once the longer marker is ruled out")
+    func settledMatchOnceLongerMarkerRuledOut() {
+        var scanner = MarkerScanner()
+        scanner.append("<|tool_call>")
+        let markers = ["<|tool_call>", "<|tool_call>call:"]
+        #expect(scanner.firstSettledMatch(of: markers, isFinal: false) == nil)
+        scanner.append("oops")
+        #expect(scanner.firstSettledMatch(of: markers, isFinal: false)?.marker == "<|tool_call>")
+        scanner = MarkerScanner()
+        scanner.append("<|tool_call>call:x")
+        #expect(
+            scanner.firstSettledMatch(of: markers, isFinal: false)?.marker == "<|tool_call>call:")
+    }
+
     @Test("Holds back against the longest candidate marker")
     func holdsBackAgainstLongestMarker() {
         var scanner = MarkerScanner()

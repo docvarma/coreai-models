@@ -41,6 +41,25 @@ package struct MarkerScanner {
         return best
     }
 
+    /// Earliest match that is safe to act on, i.e. one that no longer marker
+    /// can still grow out of once more text arrives.
+    ///
+    /// `firstMatch` alone is not enough when one marker is a prefix of another:
+    /// a buffer ending in `<|tool_call>` matches that marker exactly, yet the
+    /// next delta may turn it into `<|tool_call>call:`. Acting on the shorter
+    /// spelling there would reject a well-formed call. Withholding is bounded —
+    /// `takeSafe` holds the same bytes back, and `isFinal` settles everything.
+    package func firstSettledMatch(
+        of markers: [String],
+        isFinal: Bool
+    ) -> (marker: String, range: Range<String.Index>)? {
+        guard let best = firstMatch(of: markers) else { return nil }
+        guard !isFinal else { return best }
+        let tail = buffer[best.range.lowerBound...]
+        let canStillGrow = markers.contains { $0.count > tail.count && $0.starts(with: tail) }
+        return canStillGrow ? nil : best
+    }
+
     /// Removes and returns the text that cannot be part of a pending marker.
     /// When `isFinal` is true nothing is held back.
     package mutating func takeSafe(waitingFor markers: [String], isFinal: Bool) -> String {
