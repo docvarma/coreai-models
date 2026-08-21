@@ -18,7 +18,8 @@ import Tokenizers
 /// Foundation Models adapter for VLM bundles.
 ///
 /// ```swift
-/// let model = try await CoreAIVisionLanguageModel(resourcesAt: vlmBundleURL)
+/// let model = try await CoreAIVisionLanguageModel(
+///     resourcesAt: vlmBundleURL, protocolProfile: .qwen35XML)
 /// let session = LanguageModelSession(model: model)
 /// let response = try await session.respond {
 ///     Prompt {
@@ -30,8 +31,19 @@ import Tokenizers
 public struct CoreAIVisionLanguageModel: LanguageModel {
     public typealias Executor = CoreAIVLMExecutor
 
+    /// The caller-supplied protocol this artifact speaks. Never inferred.
+    let protocolProfile: CoreAILanguageProtocolProfile
+
+    /// `.vision` is intrinsic to the adapter; everything else comes from the
+    /// validated profile and nothing else.
+    package static func declaredCapabilities(
+        for profile: CoreAILanguageProtocolProfile
+    ) -> [LanguageModelCapabilities.Capability] {
+        [.vision] + profile.declaredCapabilities
+    }
+
     public var capabilities: LanguageModelCapabilities {
-        LanguageModelCapabilities([.vision])
+        LanguageModelCapabilities(Self.declaredCapabilities(for: protocolProfile))
     }
 
     public var executorConfiguration: CoreAIVLMExecutor.Configuration
@@ -39,8 +51,13 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
     /// Loads a VLM bundle and builds the backing engine.
     ///
     /// - Parameter url: URL to the bundle directory (`kind=vlm`).
+    /// - Parameter protocolProfile: The transcript and generated-output
+    ///   protocol this artifact speaks. Required, with no default. Validated
+    ///   against the tokenizer — including its image convention — before any
+    ///   engine is constructed.
     public init(
         resourcesAt url: URL,
+        protocolProfile: CoreAILanguageProtocolProfile,
         requestAdmission: CoreAIRequestAdmission? = nil
     ) async throws {
         let bundle = try LanguageBundle(at: url)
@@ -67,8 +84,18 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
         )
         let vlmConfig = VLMModelConfig(base: baseConfig, visionConfig: visionConfig)
 
-        // Load the tokenizer and the three model components concurrently.
-        async let tokenizerResult = bundle.loadTokenizer()
+        let tokenizer = try await bundle.loadTokenizer()
+
+        // The profile gate. Both checks run before a single model component is
+        // prepared, so a bundle whose template cannot serve the profile — or
+        // has no image convention at all — fails without paying for a load.
+        // Nothing below this line may move above it.
+        let codec = CoreAITranscriptCodec(profile: protocolProfile)
+        try codec.validate(tokenizer: tokenizer)
+        try codec.validateVisionPairing(
+            tokenizer: tokenizer, imageTokenID: visionConfig.imageTokenId)
+
+        // Prepare the three model components concurrently.
         async let visionModelResult = PreparedModel.prepare(at: visionURL)
         async let embedModelResult = PreparedModel.prepare(at: embedURL)
         async let llmModelResult = PreparedModel.prepare(at: mainURL)
@@ -81,10 +108,11 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
             options: EngineOptions()
         )
 
+        self.protocolProfile = protocolProfile
         self.executorConfiguration = CoreAIVLMExecutor.Configuration(
             bundleURL: url,
             engine: engine,
-            tokenizer: try await tokenizerResult,
+            tokenizer: tokenizer,
             visionConfig: visionConfig,
             requestAdmission: requestAdmission
         )
@@ -151,14 +179,22 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         try Self.validateImageCount(images.count)
         let cgImage = try Self.uprightCGImage(from: images[0])
 
+        // Resolve the reasoning intent before generating: a profile with no
+        // suppression mechanism refuses a disable request rather than quietly
+        // generating a thought block anyway.
+        let codec = CoreAITranscriptCodec(profile: model.protocolProfile)
+        let reasoning = try codec.reasoningConfiguration(for: request.contextOptions.reasoningLevel)
+
         try await engine.reset()
         let embeddedInput = try await engine.encodeImage(cgImage: cgImage)
 
-        let promptTokens = Self.buildPromptTokens(
+        let promptTokens = try Self.buildPromptTokens(
             userText: userText,
             imageTokenCount: embeddedInput.tokenCount,
             imageTokenId: visionConfig.imageTokenId,
-            tokenizer: tokenizer
+            tokenizer: tokenizer,
+            profile: model.protocolProfile,
+            additionalContext: reasoning.additionalContext
         )
 
         let maxTokens = request.generationOptions.maximumResponseTokens ?? 512
@@ -182,7 +218,15 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
             )
         }
 
+        // Same decoder the text adapter uses, driven by the same validated
+        // profile, so a VLM that advertises reasoning or tool calling actually
+        // segments them out instead of leaking protocol markup as response
+        // text.
+        var decoder = CoreAIStreamingOutputDecoder(
+            profile: model.protocolProfile,
+            reasoningEnabled: reasoning.enabled)
         var generatedCount = 0
+        var reasoningTokenCount = 0
         var pendingTokens: [Int] = []
         var previousText = ""
         for try await output in stream {
@@ -197,8 +241,9 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
             }
             let common = decoded.commonPrefix(with: previousText)
             let delta = String(decoded.dropFirst(common.count))
-            if !delta.isEmpty {
-                await channel.send(.response(action: .appendText(delta, tokenCount: 1)))
+            for event in try decoder.consume(delta) {
+                if case .reasoning = event { reasoningTokenCount += 1 }
+                await CoreAILanguageModel.CoreAIExecutor.dispatch(event, to: channel)
             }
             if let last = pendingTokens.last {
                 pendingTokens = [last]
@@ -206,11 +251,20 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
             }
         }
 
+        // Drain anything held back waiting for a marker, and report an
+        // unterminated block rather than dropping it.
+        for event in try decoder.finish() {
+            if case .reasoning = event { reasoningTokenCount += 1 }
+            await CoreAILanguageModel.CoreAIExecutor.dispatch(event, to: channel)
+        }
+
         await channel.send(
             .response(
                 action: .updateUsage(
                     input: .init(totalTokenCount: promptTokens.count, cachedTokenCount: 0),
-                    output: .init(totalTokenCount: generatedCount, reasoningTokenCount: 0)
+                    output: .init(
+                        totalTokenCount: generatedCount,
+                        reasoningTokenCount: reasoningTokenCount)
                 )))
     }
 
@@ -236,42 +290,37 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
     }
 
     /// Builds the token sequence for a single-image prompt.
-    private static func buildPromptTokens(
+    ///
+    /// The composition — image token, newline, user text, as one user message
+    /// put through the tokenizer's own chat template — is the same shape
+    /// `CoreAITranscriptCodec.validateVisionPairing` proved at load, so what
+    /// was validated is what runs. There is no hand-rolled prompt fallback: a
+    /// tokenizer that cannot render this is rejected, since a guessed
+    /// model-family format cannot be validated and silently produces a prompt
+    /// the artifact never saw in training.
+    static func buildPromptTokens(
         userText: String,
         imageTokenCount: Int,
         imageTokenId: Int32,
-        tokenizer: any Tokenizer
-    ) -> [Int32] {
+        tokenizer: any Tokenizer,
+        profile: CoreAILanguageProtocolProfile,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int32] {
         let imageToken = tokenizer.convertIdToToken(Int(imageTokenId)) ?? "<|image_pad|>"
-        if let templated = try? PromptUtils.maybeApplyTokenizerChatTemplate(
-            .prompt("\(imageToken)\n\(userText)"), tokenizer: tokenizer)
-        {
-            var result: [Int32] = []
-            result.reserveCapacity(templated.count + imageTokenCount)
-            var expanded = false
-            for tokenInt in templated {
-                let token = Int32(tokenInt)
-                if token == imageTokenId {
-                    if !expanded {
-                        result.append(
-                            contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
-                        expanded = true
-                    }
-                    continue
-                }
-                result.append(token)
-            }
-            if expanded { return result }
+        let messages: [Message] = [
+            ["role": "user", "content": "\(imageToken)\n\(userText)"]
+        ]
+        let templated: [Int]
+        do {
+            templated = try tokenizer.applyChatTemplate(
+                messages: messages, tools: nil, additionalContext: additionalContext)
+        } catch {
+            throw CoreAIProtocolError(profile: profile, failure: .missingChatTemplate)
         }
-
-        // Fallback for tokenizers without a multimodal chat template. Uses the
-        // Qwen3-VL ChatML format.
-        let placeholder = String(repeating: "<|image_pad|>", count: imageTokenCount)
-        let chatText =
-            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-            + "<|im_start|>user\n<|vision_start|>\(placeholder)<|vision_end|>\n"
-            + "\(userText)<|im_end|>\n<|im_start|>assistant\n"
-        return tokenizer.encode(text: chatText).map { Int32($0) }
+        return try CoreAITranscriptCodec(profile: profile).expandImagePlaceholder(
+            in: templated,
+            imageTokenID: imageTokenId,
+            imageTokenCount: imageTokenCount)
     }
 }
 

@@ -178,4 +178,63 @@ private struct FakeVisionTokenizer: Tokenizer, Sendable {
     }
 }
 
+private struct StubTemplateFailure: Error {}
+
+/// Covers `CoreAIVLMExecutor.buildPromptTokens` after the Qwen3-VL ChatML
+/// fallback was removed. The stub tokenizer sees exactly the content the
+/// executor composed, so these also pin the composition that
+/// `validateVisionPairing` mirrors.
+@Suite("VLM prompt construction")
+struct VLMPromptConstructionTests {
+    @Test("A tokenizer that cannot render the template is rejected, not worked around")
+    func templateFailureIsRejected() {
+        let tokenizer = FakeVisionTokenizer(imageTokenText: "<img>") { _ in
+            throw StubTemplateFailure()
+        }
+        // The deleted fallback hand-rolled a Qwen3-VL ChatML string here and
+        // returned tokens anyway. Reintroducing it makes this stop throwing.
+        #expect(throws: CoreAIProtocolError(profile: .qwen35XML, failure: .missingChatTemplate)) {
+            _ = try CoreAIVLMExecutor.buildPromptTokens(
+                userText: "synthetic-user",
+                imageTokenCount: 3,
+                imageTokenId: 4242,
+                tokenizer: tokenizer,
+                profile: .qwen35XML,
+                additionalContext: nil)
+        }
+    }
+
+    @Test("The rendered placeholder expands to one run of image tokens")
+    func placeholderExpandsInPlace() throws {
+        // Only the production composition — image token, newline, user text —
+        // makes this stub emit the placeholder, so a change to how the prompt
+        // is composed drops the placeholder and fails expansion.
+        let tokenizer = FakeVisionTokenizer(imageTokenText: "<img>") { content in
+            content == "<img>\nsynthetic-user" ? [1, 4242, 2] : [1, 2]
+        }
+        let tokens = try CoreAIVLMExecutor.buildPromptTokens(
+            userText: "synthetic-user",
+            imageTokenCount: 3,
+            imageTokenId: 4242,
+            tokenizer: tokenizer,
+            profile: .qwen35XML,
+            additionalContext: nil)
+        #expect(tokens == [1, 4242, 4242, 4242, 2])
+    }
+
+    @Test("A template that drops the placeholder is reported, not padded over")
+    func missingPlaceholderIsReported() {
+        let tokenizer = FakeVisionTokenizer(imageTokenText: "<img>") { _ in [1, 2, 3] }
+        #expect(throws: CoreAIProtocolError(profile: .qwen35XML, failure: .missingImagePlaceholder)) {
+            _ = try CoreAIVLMExecutor.buildPromptTokens(
+                userText: "synthetic-user",
+                imageTokenCount: 3,
+                imageTokenId: 4242,
+                tokenizer: tokenizer,
+                profile: .qwen35XML,
+                additionalContext: nil)
+        }
+    }
+}
+
 #endif

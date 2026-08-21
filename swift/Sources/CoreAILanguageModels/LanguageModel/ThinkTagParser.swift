@@ -18,8 +18,10 @@ import Foundation
 ///
 /// The marker pair is configurable at init so the same parser works for
 /// models with different conventions. Defaults are `<think>`/`</think>`.
-/// Caller is responsible for picking the right pair for a given tokenizer
-/// (see `CoreAIExecutor.detectThinkingMarkers`).
+///
+/// Superseded by `CoreAIStreamingOutputDecoder`, which takes its marker
+/// vocabulary from the validated protocol profile. This type has no remaining
+/// callers and is removed in the follow-up cleanup.
 ///
 /// Feed `delta` strings (incremental detokenizer output) via `consume(_:)`
 /// and call `flush()` once at end of stream. The parser internally holds

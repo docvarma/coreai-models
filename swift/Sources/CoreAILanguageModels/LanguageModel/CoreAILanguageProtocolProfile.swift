@@ -4,6 +4,7 @@
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import Foundation
+import FoundationModels
 
 /// A closed description of the transcript and generated-output protocol used
 /// by a precompiled Core AI language model.
@@ -44,6 +45,16 @@ public enum CoreAILanguageProtocolProfile: String, CaseIterable, Codable, Sendab
         case .qwen35XML, .gemma4Channels: true
         case .plainChat, .harmony, .atem: false
         }
+    }
+
+    /// The FoundationModels capabilities implied by the profile alone. This is
+    /// the only source of `.reasoning` and `.toolCalling` for either adapter:
+    /// nothing is inferred from the tokenizer's vocabulary.
+    package var declaredCapabilities: [LanguageModelCapabilities.Capability] {
+        var capabilities: [LanguageModelCapabilities.Capability] = []
+        if supportsReasoning { capabilities.append(.reasoning) }
+        if supportsToolCalling { capabilities.append(.toolCalling) }
+        return capabilities
     }
 }
 

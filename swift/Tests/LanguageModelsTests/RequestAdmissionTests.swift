@@ -4,6 +4,7 @@
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import CoreGraphics
+import Foundation
 import FoundationModels
 import ImageIO
 import Synchronization
@@ -120,91 +121,169 @@ struct RequestAdmissionTests {
     }
 }
 
-@Suite("Core AI reasoning markers")
-struct ReasoningMarkerTests {
-    private enum TemplateFailure: Error {
-        case rejected
-    }
+@Suite("Core AI reasoning policy")
+struct ReasoningPolicyTests {
+    /// Counts calls across the `Sendable` tokenizer stubs below without
+    /// needing a non-copyable lock inside a copyable struct.
+    private final class CallRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
 
-    @Test("only a complete marker pair advertises reasoning")
-    func completePairRequired() {
-        let complete = MockTokenizer(vocab: ["<think>": 10, "</think>": 11])
-        let openingOnly = MockTokenizer(vocab: ["<think>": 10])
-        let closingOnly = MockTokenizer(vocab: ["</think>": 11])
+        func record() {
+            lock.lock()
+            count += 1
+            lock.unlock()
+        }
 
-        #expect(CoreAILanguageModel.CoreAIExecutor.detectThinkingMarkers(using: complete) != nil)
-        #expect(CoreAILanguageModel.CoreAIExecutor.detectThinkingMarkers(using: openingOnly) == nil)
-        #expect(CoreAILanguageModel.CoreAIExecutor.detectThinkingMarkers(using: closingOnly) == nil)
-    }
-
-    @Test("automatic reasoning does not set a template flag")
-    func automaticReasoningTemplateContext() throws {
-        let observedContext = Mutex<Bool?>(nil)
-        let tokenizer = MockTokenizer(additionalContextObserver: { context in
-            observedContext.withLock { $0 = context != nil }
-        })
-        let context = try CoreAILanguageModel.CoreAIExecutor.reasoningTemplateContext(
-            nil,
-            supportsReasoning: true)
-
-        _ = try CoreAILanguageModel.CoreAIExecutor.applyChatTemplate(
-            messages: [["role": "user", "content": "synthetic"] as Message],
-            tools: nil,
-            using: tokenizer,
-            additionalContext: context)
-
-        #expect(observedContext.withLock { $0 } == false)
-    }
-
-    @Test("disabled reasoning passes enable_thinking false to the tokenizer")
-    func disabledReasoningTemplateContext() throws {
-        let observedContext = Mutex<Bool?>(nil)
-        let observedFlag = Mutex<Bool?>(nil)
-        let tokenizer = MockTokenizer(
-            vocab: ["<think>": 10, "</think>": 11],
-            additionalContextObserver: { context in
-                observedContext.withLock { $0 = context != nil }
-                observedFlag.withLock { $0 = context?["enable_thinking"] as? Bool }
-            })
-        let context = try CoreAILanguageModel.CoreAIExecutor.reasoningTemplateContext(
-            .custom("no_think"),
-            supportsReasoning: true)
-
-        _ = try CoreAILanguageModel.CoreAIExecutor.applyChatTemplate(
-            messages: [["role": "user", "content": "synthetic"] as Message],
-            tools: nil,
-            using: tokenizer,
-            additionalContext: context)
-
-        #expect(observedContext.withLock { $0 } == true)
-        #expect(observedFlag.withLock { $0 } == false)
-    }
-
-    @Test("unknown reasoning policies are rejected")
-    func unknownReasoningPolicy() {
-        #expect(throws: LanguageModelError.self) {
-            _ = try CoreAILanguageModel.CoreAIExecutor.reasoningTemplateContext(
-                .custom("unsupported"),
-                supportsReasoning: true)
+        var value: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return count
         }
     }
 
-    @Test("disabled reasoning never falls back when the template rejects its flag")
-    func disabledReasoningTemplateFailure() throws {
-        let tokenizer = MockTokenizer(additionalContextObserver: { _ in
-            throw TemplateFailure.rejected
-        })
-        let context = try CoreAILanguageModel.CoreAIExecutor.reasoningTemplateContext(
-            .custom("no_think"),
-            supportsReasoning: true)
+    private struct TemplateFailure: Error {}
 
-        #expect(throws: LanguageModelError.self) {
-            _ = try CoreAILanguageModel.CoreAIExecutor.applyChatTemplate(
-                messages: [["role": "user", "content": "synthetic"] as Message],
-                tools: nil,
-                using: tokenizer,
-                additionalContext: context)
+    /// Advertises a chat template and then refuses to render it. `encodes`
+    /// counts every plain-text `encode(text:)` — precisely the call the
+    /// deleted concatenation fallback made when the template threw.
+    private struct RefusingTemplateTokenizer: Tokenizer, Sendable {
+        let encodes: CallRecorder
+
+        var hasChatTemplate: Bool { true }
+        var bosToken: String? { nil }
+        var bosTokenId: Int? { nil }
+        var eosToken: String? { nil }
+        var eosTokenId: Int? { nil }
+        var unknownToken: String? { nil }
+        var unknownTokenId: Int? { nil }
+
+        func tokenize(text: String) -> [String] { [text] }
+        func encode(text: String) -> [Int] {
+            encodes.record()
+            return [1, 2, 3]
         }
+        func encode(text: String, addSpecialTokens: Bool) -> [Int] { encode(text: text) }
+        func callAsFunction(_ text: String, addSpecialTokens: Bool) -> [Int] { encode(text: text) }
+        func decode(tokens: [Int]) -> String { "" }
+        func decode(tokens: [Int], skipSpecialTokens: Bool) -> String { "" }
+        func convertTokenToId(_ token: String) -> Int? { nil }
+        func convertTokensToIds(_ tokens: [String]) -> [Int?] { tokens.map { _ in nil } }
+        func convertIdToToken(_ id: Int) -> String? { nil }
+        func convertIdsToTokens(_ ids: [Int]) -> [String?] { ids.map { _ in nil } }
+
+        func applyChatTemplate(messages: [Message]) throws -> [Int] { throw TemplateFailure() }
+        func applyChatTemplate(messages: [Message], tools: [ToolSpec]?) throws -> [Int] {
+            throw TemplateFailure()
+        }
+        func applyChatTemplate(
+            messages: [Message], tools: [ToolSpec]?, additionalContext: [String: any Sendable]?
+        ) throws -> [Int] {
+            throw TemplateFailure()
+        }
+        func applyChatTemplate(messages: [Message], chatTemplate: ChatTemplateArgument) throws -> [Int] {
+            throw TemplateFailure()
+        }
+        func applyChatTemplate(messages: [Message], chatTemplate: String) throws -> [Int] {
+            throw TemplateFailure()
+        }
+        func applyChatTemplate(
+            messages: [Message], chatTemplate: ChatTemplateArgument?, addGenerationPrompt: Bool,
+            truncation: Bool, maxLength: Int?, tools: [ToolSpec]?
+        ) throws -> [Int] {
+            throw TemplateFailure()
+        }
+        func applyChatTemplate(
+            messages: [Message], chatTemplate: ChatTemplateArgument?, addGenerationPrompt: Bool,
+            truncation: Bool, maxLength: Int?, tools: [ToolSpec]?,
+            additionalContext: [String: any Sendable]?
+        ) throws -> [Int] {
+            throw TemplateFailure()
+        }
+    }
+
+    private static let syntheticPrompt: [Transcript.Entry] = [
+        .prompt(Transcript.Prompt(segments: [.text(Transcript.TextSegment(content: "synthetic-user"))]))
+    ]
+
+    @Test("An unrequested reasoning level defers to the profile's own default")
+    func defaultsFollowTheProfile() throws {
+        for profile in CoreAILanguageProtocolProfile.allCases {
+            let codec = CoreAITranscriptCodec(profile: profile)
+            let configuration = try codec.reasoningConfiguration(for: nil)
+            #expect(
+                configuration.enabled == profile.defaultReasoningEnabled,
+                "\(profile.rawValue) ignored its own default")
+        }
+    }
+
+    @Test("A profile with no suppression mechanism refuses to pretend it disabled reasoning")
+    func unsuppressibleProfilesRejectDisabling() {
+        for profile in CoreAILanguageProtocolProfile.allCases
+        where profile.supportsReasoning && !profile.supportsDisablingReasoning {
+            let codec = CoreAITranscriptCodec(profile: profile)
+            #expect(
+                throws: CoreAIProtocolError(profile: profile, failure: .unsupportedReasoningPolicy),
+                "\(profile.rawValue) silently accepted a disable it cannot honor"
+            ) {
+                _ = try codec.reasoningConfiguration(for: .custom("no_think"))
+            }
+        }
+    }
+
+    @Test("A suppressible profile disables reasoning and says so to the template")
+    func suppressibleProfilesHonorDisabling() throws {
+        for profile in CoreAILanguageProtocolProfile.allCases
+        where profile.supportsDisablingReasoning {
+            let codec = CoreAITranscriptCodec(profile: profile)
+            let configuration = try codec.reasoningConfiguration(for: .custom("no_think"))
+            #expect(!configuration.enabled, "\(profile.rawValue) stayed enabled")
+            #expect(configuration.additionalContext?["enable_thinking"] as? Bool == false)
+        }
+    }
+
+    @Test("A profile without reasoning rejects every reasoning level")
+    func plainChatRejectsEveryReasoningLevel() {
+        let codec = CoreAITranscriptCodec(profile: .plainChat)
+        let levels: [ContextOptions.ReasoningLevel] = [
+            .light, .moderate, .deep, .custom("no_think"),
+        ]
+        for level in levels {
+            #expect(
+                throws: CoreAIProtocolError(profile: .plainChat, failure: .unsupportedReasoningPolicy)
+            ) {
+                _ = try codec.reasoningConfiguration(for: level)
+            }
+        }
+    }
+
+    @Test("An unknown reasoning policy is rejected rather than approximated")
+    func unknownReasoningPolicyRejected() {
+        let codec = CoreAITranscriptCodec(profile: .qwen35XML)
+        #expect(
+            throws: CoreAIProtocolError(profile: .qwen35XML, failure: .unsupportedReasoningPolicy)
+        ) {
+            _ = try codec.reasoningConfiguration(for: .custom("unsupported"))
+        }
+    }
+
+    @Test("A template that refuses the transcript never falls back to plain text")
+    func templateFailureNeverFallsBackToPlainText() throws {
+        let encodes = CallRecorder()
+        let tokenizer = RefusingTemplateTokenizer(encodes: encodes)
+        let codec = CoreAITranscriptCodec(profile: .plainChat)
+        #expect(
+            throws: CoreAIProtocolError(profile: .plainChat, failure: .incompatibleChatTemplate)
+        ) {
+            _ = try codec.encode(
+                entries: Self.syntheticPrompt,
+                tools: [],
+                reasoning: try codec.reasoningConfiguration(for: nil),
+                using: tokenizer)
+        }
+        // The deleted fallback joined the message contents and called
+        // `encode(text:)`. Reintroducing it makes this count non-zero.
+        #expect(encodes.value == 0, "the transcript was encoded as plain text after all")
     }
 }
 
