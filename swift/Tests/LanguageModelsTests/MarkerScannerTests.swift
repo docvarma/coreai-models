@@ -89,12 +89,17 @@ struct MarkerScannerTests {
     @Test("Hold-back window never splits a grapheme cluster")
     func holdBackDoesNotSplitGrapheme() {
         var scanner = MarkerScanner()
-        // The family emoji is one Character but many scalars. The hold-back
-        // window is measured in Characters and must not slice through it.
-        scanner.append("ok 👩‍👩‍👧‍👦")
+        // The family emoji is one Character but many scalars. "<thi" is a live
+        // partial of "<think>", so the hold-back boundary lands immediately
+        // after the cluster — the split point the Character-based window must
+        // get right.
+        scanner.append("ok 👩‍👩‍👧‍👦<thi")
         let emitted = scanner.takeSafe(waitingFor: ["<think>"], isFinal: false)
-        let rest = scanner.takeSafe(waitingFor: ["<think>"], isFinal: true)
-        #expect(emitted + rest == "ok 👩‍👩‍👧‍👦")
+        #expect(emitted == "ok 👩‍👩‍👧‍👦", "hold-back must release the cluster intact and withhold only the partial marker")
+
+        scanner.append("nk>after")
+        let match = scanner.firstMatch(of: ["<think>"])
+        #expect(match?.marker == "<think>")
     }
 }
 
