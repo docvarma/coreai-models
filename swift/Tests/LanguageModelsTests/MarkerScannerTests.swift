@@ -69,6 +69,33 @@ struct MarkerScannerTests {
         #expect(scanner.takeUpTo(before) == "before")
         #expect(scanner.takeAll() == "after")
     }
+
+    @Test("Empty marker in the set is ignored, never matched")
+    func emptyMarkerIgnored() {
+        var scanner = MarkerScanner()
+        scanner.append("plain text")
+        #expect(scanner.firstMatch(of: ["", "<think>"]) == nil)
+        #expect(scanner.takeSafe(waitingFor: ["", "<think>"], isFinal: false) == "plain text")
+    }
+
+    @Test("Marker longer than the buffer holds the whole buffer back")
+    func markerLongerThanBuffer() {
+        var scanner = MarkerScanner()
+        scanner.append("<a")
+        #expect(scanner.takeSafe(waitingFor: ["<atem:function_calls>"], isFinal: false) == "")
+        #expect(scanner.takeSafe(waitingFor: ["<atem:function_calls>"], isFinal: true) == "<a")
+    }
+
+    @Test("Hold-back window never splits a grapheme cluster")
+    func holdBackDoesNotSplitGrapheme() {
+        var scanner = MarkerScanner()
+        // The family emoji is one Character but many scalars. The hold-back
+        // window is measured in Characters and must not slice through it.
+        scanner.append("ok 👩‍👩‍👧‍👦")
+        let emitted = scanner.takeSafe(waitingFor: ["<think>"], isFinal: false)
+        let rest = scanner.takeSafe(waitingFor: ["<think>"], isFinal: true)
+        #expect(emitted + rest == "ok 👩‍👩‍👧‍👦")
+    }
 }
 
 #endif

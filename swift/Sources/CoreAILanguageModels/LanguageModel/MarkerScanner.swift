@@ -5,8 +5,6 @@
 
 import Foundation
 
-#if (arch(arm64) || arch(arm64e)) && canImport(CoreAI)
-
 /// Incremental text buffer that never emits a partial reserved marker.
 ///
 /// Generalizes the single-marker hold-back that `ThinkTagParser` and
@@ -79,5 +77,3 @@ package struct MarkerScanner {
         return buffer.endIndex
     }
 }
-
-#endif
