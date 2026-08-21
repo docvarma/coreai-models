@@ -185,6 +185,38 @@ package struct CoreAITranscriptCodec {
         return result
     }
 
+    /// Confirms this profile's template renders exactly one image
+    /// placeholder, so a VLM bundle is only paired with a profile that has
+    /// an image convention. Called during validation, before engine load.
+    ///
+    /// The fixture mirrors `CoreAIVisionLanguageModel.buildPromptTokens`,
+    /// which resolves the image token via
+    /// `tokenizer.convertIdToToken(imageTokenId)` (falling back to
+    /// `"<|image_pad|>"`), composes the prompt as
+    /// `"\(imageToken)\n\(userText)"`, and applies the chat template to a
+    /// single user message holding that string. Validating anything else —
+    /// a text-only fixture, a different composition — would prove nothing
+    /// about what production actually renders.
+    package func validateVisionPairing(
+        tokenizer: any Tokenizer,
+        imageTokenID: Int32
+    ) throws {
+        let imageToken = tokenizer.convertIdToToken(Int(imageTokenID)) ?? "<|image_pad|>"
+        let messages: [Message] = [
+            ["role": "user", "content": "\(imageToken)\nsynthetic-user"]
+        ]
+        let tokens: [Int]
+        do {
+            tokens = try tokenizer.applyChatTemplate(messages: messages)
+        } catch {
+            throw failure(.incompatibleChatTemplate)
+        }
+        let count = tokens.filter { $0 == Int(imageTokenID) }.count
+        guard count == 1 else {
+            throw failure(count == 0 ? .missingImagePlaceholder : .duplicateImagePlaceholder)
+        }
+    }
+
     // MARK: - Transcript messages
 
     private func textOnly(_ segments: [Transcript.Segment]) throws -> String {
