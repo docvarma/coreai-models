@@ -30,6 +30,17 @@ public final class FixedNDArrayState: SyncStateHandler {
         self.stateNames = states.map(\.name)
     }
 
+    init(states: [(name: String, array: NDArray)]) {
+        var arrays: [String: NDArray] = [:]
+        for (name, value) in states {
+            var array = value
+            zeroFillNDArray(&array)
+            arrays[name] = array
+        }
+        self.arrays = arrays
+        self.stateNames = states.map(\.name)
+    }
+
     public func ensureCapacity(forContextLength contextLength: Int) throws -> Bool {
         false
     }

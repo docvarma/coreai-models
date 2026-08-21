@@ -17,7 +17,8 @@ struct PublicInterfaceTests {
     ///
     /// Mirrors the snippet in README.md:
     /// ```swift
-    /// let model = try await CoreAILanguageModel(resourcesAt: url)
+    /// let model = try await CoreAILanguageModel(
+    ///     resourcesAt: url, protocolProfile: .qwen35XML)
     /// let session = LanguageModelSession(model: model)
     /// let response = try await session.respond(to: "…")
     /// print(response.content)
@@ -26,7 +27,8 @@ struct PublicInterfaceTests {
     func documentedUsageCompiles() async {
         let missing = URL(fileURLWithPath: "/nonexistent/model")
         await #expect(throws: (any Error).self) {
-            let model = try await CoreAILanguageModel(resourcesAt: missing)
+            let model = try await CoreAILanguageModel(
+                resourcesAt: missing, protocolProfile: .qwen35XML)
             let session = LanguageModelSession(model: model)
             let response = try await session.respond(to: "test")
             _ = response.content
@@ -38,7 +40,8 @@ struct PublicInterfaceTests {
     func resourceControlAPICompiles() async {
         let missing = URL(fileURLWithPath: "/nonexistent/model")
         await #expect(throws: (any Error).self) {
-            let model = try await CoreAILanguageModel(resourcesAt: missing, mode: .lazy)
+            let model = try await CoreAILanguageModel(
+                resourcesAt: missing, protocolProfile: .qwen35XML, mode: .lazy)
             _ = model.estimatedSizeOnDiskBytes
             try await model.load()
             model.unload()

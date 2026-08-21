@@ -595,47 +595,18 @@ private struct EngineImpl: ~Copyable {
                 "Cannot find function '\(config.function)' in model")
         }
 
-        // Validate: 2 inputs, 1+ output, 2 states
-        guard descriptor.inputNames.count == 2 else {
-            throw InferenceRuntimeError.invalidInputType(
-                "Expected 2 inputs, got \(descriptor.inputNames.count): \(descriptor.inputNames)")
-        }
-        guard descriptor.outputNames.count >= 1 else {
-            throw InferenceRuntimeError.invalidOutputType(
-                "Expected at least 1 output, got \(descriptor.outputNames.count)")
-        }
-        guard descriptor.stateNames.count >= 2 && descriptor.stateNames.count <= 4 else {
-            throw InferenceRuntimeError.invalidOutputType(
-                "Expected 2–4 states, got \(descriptor.stateNames.count): \(descriptor.stateNames)"
-            )
-        }
-
-        // Classify states using the shared factory logic
-        let classified = StateHandlerFactory.classifyStates(
-            descriptor: descriptor, stateKinds: nil, verbose: descriptor.stateNames.count > 2)
-
-        // Find the growing KV pair (first two states with .kvCache kind)
-        let growingNames = classified.filter { $0.kind == .kvCache }.map(\.name)
-        guard growingNames.count >= 2 else {
-            throw InferenceRuntimeError.invalidOutputType(
-                "Expected at least 2 growing KV cache states, found \(growingNames.count) "
-                    + "in: \(classified.map { "\($0.name)=\($0.kind.rawValue)" })")
-        }
-        let keyCacheName = growingNames[0]
-        let valueCacheName = growingNames[1]
-
-        // Fixed states: everything that isn't the primary growing KV pair
-        let fixedNames =
-            classified
-            .filter { $0.kind == .slidingCache || $0.kind == .fixed }
-            .map(\.name)
-        // Additional growing states beyond the primary pair
-        let extraGrowingNames = Array(growingNames.dropFirst(2))
+        let graphABI = try LanguageGraphABI.validate(
+            descriptor: descriptor,
+            expectedVocabSize: config.vocabSize
+        )
+        let keyCacheName = graphABI.keyCache.name
+        let valueCacheName = graphABI.valueCache.name
+        let fixedNames = graphABI.persistentStates.map(\.name)
 
         // Extract names
-        let inputIdsName = descriptor.inputNames[0]
-        let positionIdsName = descriptor.inputNames[1]
-        let logitsOutputName = descriptor.outputNames[0]
+        let inputIdsName = graphABI.inputIDs.name
+        let positionIdsName = graphABI.positionIDs.name
+        let logitsOutputName = graphABI.logits.name
 
         // Extract state descriptors for KV cache shape/type
         guard case .ndArray(let keyCacheDesc) = descriptor.stateDescriptor(of: keyCacheName),
@@ -721,24 +692,18 @@ private struct EngineImpl: ~Copyable {
 
         // Allocate fixed-size buffers for additional persistent states (sliding caches, hybrid states).
         var additionalStatesLocal: FixedMTLBufferState? = nil
-        let allFixedNames = fixedNames + extraGrowingNames  // extra growing get resolved to max size
-        if !allFixedNames.isEmpty {
+        if !fixedNames.isEmpty {
             var extraStates: [(name: String, descriptor: NDArrayDescriptor)] = []
-            for name in allFixedNames {
+            for name in fixedNames {
                 guard case .ndArray(let desc) = descriptor.stateDescriptor(of: name) else {
                     throw InferenceRuntimeError.invalidOutputType(
                         "Cannot get descriptor for persistent state '\(name)'")
                 }
-                // Resolve dynamic dims to max for any extra growing states
-                let resolved =
-                    desc.shape.contains(where: { $0 < 0 })
-                    ? desc.resolvingDynamicDimensions(desc.shape.map { $0 < 0 ? config.maxContextLength : $0 })
-                    : desc
-                extraStates.append((name, resolved))
+                extraStates.append((name, desc))
             }
             additionalStatesLocal = try FixedMTLBufferState(states: extraStates, device: device)
             CLILogger.log(
-                "Pipelined additional states: \(allFixedNames.joined(separator: ", "))")
+                "Pipelined additional states: \(fixedNames.joined(separator: ", "))")
         }
 
         // Create growing logits buffer (reuses TensorStorage+CoreAI.swift)
@@ -787,7 +752,7 @@ private struct EngineImpl: ~Copyable {
         self.decodeLogitsBuffers = decodeLogBufs
         self.kvCache = kvCacheLocal
         self.additionalStates = additionalStatesLocal
-        self.hasNonTruncatableStates = classified.contains(where: { $0.kind == .fixed })
+        self.hasNonTruncatableStates = !fixedNames.isEmpty
         self.logits = logitsRef
         self.cachedSampler = nil
         self.cachedSamplerTemperature = nil

@@ -107,26 +107,15 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         }
         self.functionDescriptor = descriptor
 
-        // Validate model architecture: 2 inputs, 1+ output, at least KV cache pair.
-        // Hybrid models may declare additional persistent fixed-shape states.
-        guard descriptor.inputNames.count == 2 else {
-            throw InferenceRuntimeError.invalidInputType(
-                "Expected 2 inputs, got \(descriptor.inputNames.count): \(descriptor.inputNames)")
-        }
-        guard descriptor.outputNames.count >= 1 else {
-            throw InferenceRuntimeError.invalidOutputType(
-                "Expected at least 1 output, got \(descriptor.outputNames.count): \(descriptor.outputNames)")
-        }
-        guard descriptor.stateNames.count >= 2 && descriptor.stateNames.count <= 4 else {
-            throw InferenceRuntimeError.invalidOutputType(
-                "Expected 2–4 states (KV cache + optional persistent states), got \(descriptor.stateNames.count): "
-                    + "states=\(descriptor.stateNames), outputs=\(descriptor.outputNames)")
-        }
+        let graphABI = try LanguageGraphABI.validate(
+            descriptor: descriptor,
+            expectedVocabSize: config.vocabSize
+        )
 
         // Extract names
-        self.inputIdsName = descriptor.inputNames[0]
-        self.positionIdsName = descriptor.inputNames[1]
-        self.logitsName = descriptor.outputNames[0]
+        self.inputIdsName = graphABI.inputIDs.name
+        self.positionIdsName = graphABI.positionIDs.name
+        self.logitsName = graphABI.logits.name
 
         // Extract and validate input descriptors
         guard case .ndArray(let inputIdsDesc) = descriptor.inputDescriptor(of: inputIdsName) else {
@@ -153,6 +142,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         let stateHandlers = try StateHandlerFactory.createSyncHandlers(
             descriptor: descriptor,
             maxContextLength: config.maxContextLength,
+            stateKinds: graphABI.stateKinds,
             options: options
         )
         self.kvCache = stateHandlers.kvCache

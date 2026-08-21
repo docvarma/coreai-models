@@ -87,6 +87,30 @@ struct StateHandlerConformanceTests {
     func fixedConformance() {
         let _: any SyncStateHandler.Type = FixedNDArrayState.self
     }
+
+    @Test("Fixed persistent state resets for repeated sessions")
+    func fixedStateRepeatedReset() {
+        let descriptors = [
+            (name: "conv", array: NDArray(shape: [1, 4], scalarType: .float16)),
+            (name: "recurrent", array: NDArray(shape: [1, 4], scalarType: .float16)),
+        ]
+        let states = FixedNDArrayState(states: descriptors)
+
+        for _ in 0..<2 {
+            for index in 0..<states.stateCount {
+                var state = states[stateIndex: index]
+                fillNDArray(&state.array, as: Float16.self, count: 4) { Float16($0 + 1) }
+                states[stateIndex: index] = state
+            }
+
+            states.reset()
+
+            for index in 0..<states.stateCount {
+                let values = readNDArray(states[stateIndex: index].array, as: Float16.self, count: 4)
+                #expect(values == [0, 0, 0, 0])
+            }
+        }
+    }
 }
 
 // MARK: - withBoundStates Tests

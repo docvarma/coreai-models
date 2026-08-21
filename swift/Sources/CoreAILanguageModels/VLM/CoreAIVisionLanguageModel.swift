@@ -7,8 +7,10 @@
 
 import CoreAI
 import CoreGraphics
+import CoreImage
 import Foundation
 import FoundationModels
+import ImageIO
 import Tokenizers
 
 // MARK: - CoreAIVisionLanguageModel
@@ -16,7 +18,8 @@ import Tokenizers
 /// Foundation Models adapter for VLM bundles.
 ///
 /// ```swift
-/// let model = try await CoreAIVisionLanguageModel(resourcesAt: vlmBundleURL)
+/// let model = try await CoreAIVisionLanguageModel(
+///     resourcesAt: vlmBundleURL, protocolProfile: .qwen35XML)
 /// let session = LanguageModelSession(model: model)
 /// let response = try await session.respond {
 ///     Prompt {
@@ -28,8 +31,36 @@ import Tokenizers
 public struct CoreAIVisionLanguageModel: LanguageModel {
     public typealias Executor = CoreAIVLMExecutor
 
+    /// The caller-supplied protocol this artifact speaks. Never inferred.
+    let protocolProfile: CoreAILanguageProtocolProfile
+
+    /// All EOS-like token IDs beyond the tokenizer's main `eosTokenId` — e.g.
+    /// Gemma's `<end_of_turn>`, read from tokenizer_config.json at init. Read
+    /// exactly as `CoreAILanguageModel` reads it, so the two adapters stop on
+    /// the same tokens.
+    let additionalEosTokenIds: [Int32]
+
+    /// `.vision` is intrinsic to the adapter. `.reasoning` follows the
+    /// validated profile, because this executor runs the shared output decoder
+    /// and really does segment reasoning out of the stream.
+    ///
+    /// `.toolCalling` is deliberately withheld even for the four profiles whose
+    /// `supportsToolCalling` is true. `CoreAIVLMExecutor.respond` never reads
+    /// `request.enabledToolDefinitions` and `buildPromptTokens` has no `tools:`
+    /// parameter, so a session attaching tools here would have them accepted
+    /// and thrown away — the same silent drop this provider exists to delete,
+    /// moved from reasoning to tools. Add `.toolCalling` to this list only in
+    /// the change that renders tool definitions into the vision prompt.
+    package static func declaredCapabilities(
+        for profile: CoreAILanguageProtocolProfile
+    ) -> [LanguageModelCapabilities.Capability] {
+        var capabilities: [LanguageModelCapabilities.Capability] = [.vision]
+        if profile.supportsReasoning { capabilities.append(.reasoning) }
+        return capabilities
+    }
+
     public var capabilities: LanguageModelCapabilities {
-        LanguageModelCapabilities([.vision])
+        LanguageModelCapabilities(Self.declaredCapabilities(for: protocolProfile))
     }
 
     public var executorConfiguration: CoreAIVLMExecutor.Configuration
@@ -37,7 +68,15 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
     /// Loads a VLM bundle and builds the backing engine.
     ///
     /// - Parameter url: URL to the bundle directory (`kind=vlm`).
-    public init(resourcesAt url: URL) async throws {
+    /// - Parameter protocolProfile: The transcript and generated-output
+    ///   protocol this artifact speaks. Required, with no default. Validated
+    ///   against the tokenizer — including its image convention — before any
+    ///   engine is constructed.
+    public init(
+        resourcesAt url: URL,
+        protocolProfile: CoreAILanguageProtocolProfile,
+        requestAdmission: CoreAIRequestAdmission? = nil
+    ) async throws {
         let bundle = try LanguageBundle(at: url)
         guard bundle.bundle.kind == .vlm else {
             throw InferenceRuntimeError.invalidArgument(
@@ -62,8 +101,18 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
         )
         let vlmConfig = VLMModelConfig(base: baseConfig, visionConfig: visionConfig)
 
-        // Load the tokenizer and the three model components concurrently.
-        async let tokenizerResult = bundle.loadTokenizer()
+        let tokenizer = try await bundle.loadTokenizer()
+
+        // The profile gate. Both checks run before a single model component is
+        // prepared, so a bundle whose template cannot serve the profile — or
+        // has no image convention at all — fails without paying for a load.
+        // Nothing below this line may move above it.
+        let codec = CoreAITranscriptCodec(profile: protocolProfile)
+        try codec.validate(tokenizer: tokenizer)
+        try codec.validateVisionPairing(
+            tokenizer: tokenizer, imageTokenID: visionConfig.imageTokenId)
+
+        // Prepare the three model components concurrently.
         async let visionModelResult = PreparedModel.prepare(at: visionURL)
         async let embedModelResult = PreparedModel.prepare(at: embedURL)
         async let llmModelResult = PreparedModel.prepare(at: mainURL)
@@ -76,11 +125,22 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
             options: EngineOptions()
         )
 
+        self.protocolProfile = protocolProfile
+        // Read additional stop token IDs from tokenizer_config.json (e.g.
+        // Gemma's <end_of_turn>). Empty when the bundle has no tokenizer
+        // directory.
+        if let tokenizerDir = bundle.tokenizerPath {
+            self.additionalEosTokenIds = LanguageConfig.additionalStopTokenIds(
+                from: tokenizerDir, tokenizer: tokenizer)
+        } else {
+            self.additionalEosTokenIds = []
+        }
         self.executorConfiguration = CoreAIVLMExecutor.Configuration(
             bundleURL: url,
             engine: engine,
-            tokenizer: try await tokenizerResult,
-            visionConfig: visionConfig
+            tokenizer: tokenizer,
+            visionConfig: visionConfig,
+            requestAdmission: requestAdmission
         )
     }
 }
@@ -95,23 +155,28 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         let engine: CoreAISequentialVLMEngine
         let tokenizer: any Tokenizer
         let visionConfig: VisionConfig
+        let requestAdmission: CoreAIRequestAdmission?
 
         public static func == (lhs: Configuration, rhs: Configuration) -> Bool {
             lhs.bundleURL == rhs.bundleURL
+                && lhs.requestAdmission == rhs.requestAdmission
         }
         public func hash(into hasher: inout Hasher) {
             hasher.combine(bundleURL)
+            hasher.combine(requestAdmission)
         }
     }
 
     private let engine: CoreAISequentialVLMEngine
     private let tokenizer: any Tokenizer
     private let visionConfig: VisionConfig
+    private let requestAdmission: CoreAIRequestAdmission?
 
     public init(configuration: Configuration) throws {
         self.engine = configuration.engine
         self.tokenizer = configuration.tokenizer
         self.visionConfig = configuration.visionConfig
+        self.requestAdmission = configuration.requestAdmission
     }
 
     public nonisolated(nonsending) func respond(
@@ -119,7 +184,7 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         model: CoreAIVisionLanguageModel,
         streamingInto channel: LanguageModelExecutorGenerationChannel
     ) async throws {
-        var cgImage: CGImage?
+        var images: [Transcript.ImageAttachment] = []
         var userText = ""
         for entry in request.transcript {
             guard case .prompt(let prompt) = entry else { continue }
@@ -128,8 +193,8 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
                 case .text(let text):
                     userText += text.content
                 case .attachment(let attachment):
-                    if cgImage == nil, case .image(let image) = attachment.content {
-                        cgImage = image.cgImage
+                    if case .image(let image) = attachment.content {
+                        images.append(image)
                     }
                 default:
                     break
@@ -137,42 +202,132 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
             }
         }
 
-        guard let cgImage else {
-            throw LanguageModelError.unsupportedTranscriptContent(
-                .init(
-                    unsupportedContent: Array(request.transcript),
-                    debugDescription:
-                        "CoreAIVisionLanguageModel requires an image attachment in the prompt."
-                ))
-        }
+        try Self.validateImageCount(images.count)
+        let cgImage = try Self.uprightCGImage(from: images[0])
+
+        // Resolve the reasoning intent before generating: a profile with no
+        // suppression mechanism refuses a disable request rather than quietly
+        // generating a thought block anyway.
+        let codec = CoreAITranscriptCodec(profile: model.protocolProfile)
+        let reasoning = try codec.reasoningConfiguration(for: request.contextOptions.reasoningLevel)
 
         try await engine.reset()
         let embeddedInput = try await engine.encodeImage(cgImage: cgImage)
 
-        let promptTokens = Self.buildPromptTokens(
+        let promptTokens = try Self.buildPromptTokens(
             userText: userText,
             imageTokenCount: embeddedInput.tokenCount,
             imageTokenId: visionConfig.imageTokenId,
-            tokenizer: tokenizer
+            tokenizer: tokenizer,
+            profile: model.protocolProfile,
+            additionalContext: reasoning.additionalContext
         )
 
         let maxTokens = request.generationOptions.maximumResponseTokens ?? 512
+        let metrics = CoreAIRequestMetrics(
+            inputTokenCount: promptTokens.count,
+            reservedOutputTokenCount: maxTokens,
+            attachmentCount: images.count)
+        let stopTokens = Self.stopTokenIDs(
+            tokenizer: tokenizer, additionalEosTokenIds: model.additionalEosTokenIds)
+
+        let stream = try await CoreAIRequestAdmission.perform(
+            metrics: metrics,
+            admission: requestAdmission
+        ) {
+            try await engine.generate(
+                with: embeddedInput,
+                tokens: promptTokens,
+                samplingConfiguration: SamplingConfiguration(temperature: 1.0, topK: 1),
+                inferenceOptions: InferenceOptions(maxTokens: maxTokens, includeLogits: false)
+            )
+        }
+
+        let outcome = try await Self.consumeGeneration(
+            stream: stream,
+            stopTokens: stopTokens,
+            tokenizer: tokenizer,
+            profile: model.protocolProfile,
+            reasoningEnabled: reasoning.enabled
+        ) { event in
+            await CoreAILanguageModel.CoreAIExecutor.dispatch(event, to: channel)
+        }
+
+        await channel.send(
+            .response(
+                action: .updateUsage(
+                    input: .init(totalTokenCount: promptTokens.count, cachedTokenCount: 0),
+                    output: .init(
+                        totalTokenCount: outcome.generatedTokenCount,
+                        reasoningTokenCount: outcome.reasoningTokenCount)
+                )))
+    }
+
+    // MARK: - End of turn
+
+    /// Every token that ends a turn for this artifact.
+    ///
+    /// The tokenizer's own `eosTokenId` plus the artifact's declared extra
+    /// stop tokens, exactly as `CoreAILanguageModel`'s text path unions them.
+    /// There is deliberately no hardcoded spelling here: a literal such as
+    /// `<|im_end|>` is a model-family guess, and a bundle whose family ends
+    /// turns some other way (Gemma's `<end_of_turn>`) would run past its own
+    /// end of turn and stream both the raw marker and a fabricated next turn
+    /// to the caller as response text.
+    package static func stopTokenIDs(
+        tokenizer: any Tokenizer,
+        additionalEosTokenIds: [Int32]
+    ) -> Set<Int32> {
         var stopTokens = Set<Int32>()
         if let eos = tokenizer.eosTokenId { stopTokens.insert(Int32(eos)) }
-        if let imEnd = tokenizer.convertTokenToId("<|im_end|>") { stopTokens.insert(Int32(imEnd)) }
+        stopTokens.formUnion(additionalEosTokenIds)
+        return stopTokens
+    }
 
-        let stream = try await engine.generate(
-            with: embeddedInput,
-            tokens: promptTokens,
-            samplingConfiguration: SamplingConfiguration(temperature: 1.0, topK: 1),
-            inferenceOptions: InferenceOptions(maxTokens: maxTokens, includeLogits: false)
-        )
+    /// What one consumed generation stream produced, beyond the events already
+    /// handed to `emit`.
+    package struct GenerationOutcome: Equatable, Sendable {
+        package var generatedTokenCount: Int
+        package var reasoningTokenCount: Int
+        /// True when the model emitted an end-of-turn token. Distinguishes
+        /// "the model ended its turn" from "we ran out of budget", which
+        /// decide whether an open block at the end of the stream is a protocol
+        /// violation or ordinary truncation.
+        package var stoppedOnStopToken: Bool
+    }
 
+    /// Drives one token stream through the shared streaming decoder.
+    ///
+    /// Split out of `respond` so the end-of-turn contract is exercisable
+    /// without a model: the stop-token check, the incremental detokenizer and
+    /// the truncation decision handed to `finish` all live here, and a test
+    /// drives them with a synthetic token sequence.
+    ///
+    /// The decoder is the same one the text adapter uses, driven by the same
+    /// validated profile, so a VLM that advertises reasoning or tool calling
+    /// actually segments them out instead of leaking protocol markup as
+    /// response text.
+    package static func consumeGeneration<Stream: AsyncSequence>(
+        stream: Stream,
+        stopTokens: Set<Int32>,
+        tokenizer: any Tokenizer,
+        profile: CoreAILanguageProtocolProfile,
+        reasoningEnabled: Bool,
+        emit: (CoreAIStreamingOutputDecoder.Event) async -> Void
+    ) async throws -> GenerationOutcome where Stream.Element == InferenceOutput {
+        var decoder = CoreAIStreamingOutputDecoder(
+            profile: profile,
+            reasoningEnabled: reasoningEnabled)
         var generatedCount = 0
+        var reasoningTokenCount = 0
         var pendingTokens: [Int] = []
         var previousText = ""
+        var stoppedOnStopToken = false
         for try await output in stream {
-            if stopTokens.contains(output.tokenId) { break }
+            if stopTokens.contains(output.tokenId) {
+                stoppedOnStopToken = true
+                break
+            }
             generatedCount += 1
             pendingTokens.append(Int(output.tokenId))
 
@@ -183,8 +338,9 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
             }
             let common = decoded.commonPrefix(with: previousText)
             let delta = String(decoded.dropFirst(common.count))
-            if !delta.isEmpty {
-                await channel.send(.response(action: .appendText(delta, tokenCount: 1)))
+            for event in try decoder.consume(delta) {
+                if case .reasoning = event { reasoningTokenCount += 1 }
+                await emit(event)
             }
             if let last = pendingTokens.last {
                 pendingTokens = [last]
@@ -192,52 +348,80 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
             }
         }
 
-        await channel.send(
-            .response(
-                action: .updateUsage(
-                    input: .init(totalTokenCount: promptTokens.count, cachedTokenCount: 0),
-                    output: .init(totalTokenCount: generatedCount, reasoningTokenCount: 0)
-                )))
+        // Drain anything held back waiting for a marker. An unterminated block
+        // is reported only when the model chose to stop; a capped or cancelled
+        // generation flushes its partial content instead.
+        for event in try decoder.finish(truncated: !stoppedOnStopToken) {
+            if case .reasoning = event { reasoningTokenCount += 1 }
+            await emit(event)
+        }
+
+        return GenerationOutcome(
+            generatedTokenCount: generatedCount,
+            reasoningTokenCount: reasoningTokenCount,
+            stoppedOnStopToken: stoppedOnStopToken)
     }
 
     // MARK: - Prompt Construction
 
+    static func uprightCGImage(
+        from image: Transcript.ImageAttachment
+    ) throws -> CGImage {
+        let oriented = image.ciImage.oriented(image.orientation)
+        let extent = oriented.extent.integral
+        guard !extent.isEmpty,
+            let rendered = CIContext(options: nil).createCGImage(oriented, from: extent)
+        else {
+            throw CoreAIVisionRequestError.imageRenderFailed
+        }
+        return rendered
+    }
+
+    static func validateImageCount(_ count: Int) throws {
+        guard count == 1 else {
+            throw CoreAIVisionRequestError.requiresExactlyOneImage(actualCount: count)
+        }
+    }
+
     /// Builds the token sequence for a single-image prompt.
-    private static func buildPromptTokens(
+    ///
+    /// The composition — image token, newline, user text, as one user message
+    /// put through the tokenizer's own chat template — is the same shape
+    /// `CoreAITranscriptCodec.validateVisionPairing` proved at load, so what
+    /// was validated is what runs. There is no hand-rolled prompt fallback: a
+    /// tokenizer that cannot render this is rejected, since a guessed
+    /// model-family format cannot be validated and silently produces a prompt
+    /// the artifact never saw in training.
+    static func buildPromptTokens(
         userText: String,
         imageTokenCount: Int,
         imageTokenId: Int32,
-        tokenizer: any Tokenizer
-    ) -> [Int32] {
+        tokenizer: any Tokenizer,
+        profile: CoreAILanguageProtocolProfile,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int32] {
         let imageToken = tokenizer.convertIdToToken(Int(imageTokenId)) ?? "<|image_pad|>"
-        if let templated = try? PromptUtils.maybeApplyTokenizerChatTemplate(
-            .prompt("\(imageToken)\n\(userText)"), tokenizer: tokenizer)
-        {
-            var result: [Int32] = []
-            result.reserveCapacity(templated.count + imageTokenCount)
-            var expanded = false
-            for tokenInt in templated {
-                let token = Int32(tokenInt)
-                if token == imageTokenId {
-                    if !expanded {
-                        result.append(
-                            contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
-                        expanded = true
-                    }
-                    continue
-                }
-                result.append(token)
-            }
-            if expanded { return result }
+        let messages: [Message] = [
+            ["role": "user", "content": "\(imageToken)\n\(userText)"]
+        ]
+        let templated: [Int]
+        do {
+            templated = try tokenizer.applyChatTemplate(
+                messages: messages, tools: nil, additionalContext: additionalContext)
+        } catch {
+            throw CoreAIProtocolError(profile: profile, failure: .missingChatTemplate)
         }
-
-        // Fallback for tokenizers without a multimodal chat template. Uses the
-        // Qwen3-VL ChatML format.
-        let placeholder = String(repeating: "<|image_pad|>", count: imageTokenCount)
-        let chatText =
-            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-            + "<|im_start|>user\n<|vision_start|>\(placeholder)<|vision_end|>\n"
-            + "\(userText)<|im_end|>\n<|im_start|>assistant\n"
-        return tokenizer.encode(text: chatText).map { Int32($0) }
+        return try CoreAITranscriptCodec(profile: profile).expandImagePlaceholder(
+            in: templated,
+            imageTokenID: imageTokenId,
+            imageTokenCount: imageTokenCount)
     }
+}
+
+/// Fail-closed request validation errors for the currently pinned Core AI VLM
+/// adapter. Its backend supports one image per generation and does not accept a
+/// text-only request.
+public enum CoreAIVisionRequestError: Error, Equatable, Sendable {
+    case requiresExactlyOneImage(actualCount: Int)
+    case imageRenderFailed
 }

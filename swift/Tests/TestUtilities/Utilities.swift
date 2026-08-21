@@ -33,9 +33,15 @@ public struct MockTokenizer: Tokenizer, Sendable {
     /// the default first-UTF-8-byte behaviour (which collides for tokens sharing
     /// a leading character, e.g. `<eos>` and `<end_of_turn>`).
     public let vocab: [String: Int]
+    public let additionalContextObserver: (@Sendable ([String: any Sendable]?) throws -> Void)?
 
-    public init(vocab: [String: Int] = [:]) {
+    public init(
+        vocab: [String: Int] = [:],
+        additionalContextObserver:
+            (@Sendable ([String: any Sendable]?) throws -> Void)? = nil
+    ) {
         self.vocab = vocab
+        self.additionalContextObserver = additionalContextObserver
     }
 
     public var bosToken: String? { nil }
@@ -100,7 +106,8 @@ public struct MockTokenizer: Tokenizer, Sendable {
     public func applyChatTemplate(
         messages: [Message], tools: [ToolSpec]?, additionalContext: [String: any Sendable]?
     ) throws -> [Int] {
-        try applyChatTemplate(messages: messages)
+        try additionalContextObserver?(additionalContext)
+        return try applyChatTemplate(messages: messages)
     }
 
     public func applyChatTemplate(messages: [Message], chatTemplate: ChatTemplateArgument) throws -> [Int] {
