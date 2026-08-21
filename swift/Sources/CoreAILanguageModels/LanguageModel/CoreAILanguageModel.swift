@@ -645,8 +645,8 @@ public struct CoreAILanguageModel: LanguageModel {
 /// API, not nested under response, because at decode time we do not yet know
 /// whether the model will follow a thought block with a response or a tool
 /// call — and a completed call becomes `.toolCalls(...).toolCall`. An empty
-/// text fragment is dropped rather than sent, which is what the superseded
-/// `ThinkTagParser` / `ToolCallParser` pair emitted.
+/// text fragment is dropped rather than sent, matching the behavior of the
+/// single-marker hold-back parsers this decoder superseded.
 package enum CoreAIChannelRouting: Equatable, Sendable {
     case drop
     case appendResponseText(String)

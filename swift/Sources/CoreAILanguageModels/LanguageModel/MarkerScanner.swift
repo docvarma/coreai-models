@@ -7,10 +7,11 @@ import Foundation
 
 /// Incremental text buffer that never emits a partial reserved marker.
 ///
-/// Generalizes the single-marker hold-back that `ThinkTagParser` and
-/// `ToolCallParser` each implemented separately: callers supply the set of
-/// markers currently meaningful, and the scanner withholds only the trailing
-/// characters that could still grow into one of them.
+/// Generalizes single-marker hold-back — the pattern earlier streaming
+/// parsers each implemented separately, one marker pair at a time — to an
+/// arbitrary set: callers supply the markers currently meaningful, and the
+/// scanner withholds only the trailing characters that could still grow into
+/// one of them.
 package struct MarkerScanner {
     private var buffer: String = ""
 

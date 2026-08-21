@@ -90,8 +90,8 @@ package struct CoreAIStreamingOutputDecoder {
     ///   closed out without a failure, so a long chain-of-thought that runs
     ///   into the cap yields its partial reasoning instead of destroying the
     ///   whole response. A partially buffered tool call is still dropped —
-    ///   half a call cannot be dispatched — which is what the superseded
-    ///   `ToolCallParser.flush()` did with an unclosed block.
+    ///   half a call cannot be dispatched — the same drop-on-truncation
+    ///   behavior earlier hold-back parsers applied to an unclosed block.
     ///
     ///   There is deliberately no default: forgetting the argument would
     ///   silently reinstate the strict behavior on a truncated stream.
