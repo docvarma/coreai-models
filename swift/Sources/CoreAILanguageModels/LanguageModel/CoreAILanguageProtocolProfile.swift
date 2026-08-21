@@ -58,7 +58,11 @@ public enum CoreAILanguageProtocolProfile: String, CaseIterable, Codable, Sendab
     }
 }
 
-/// Stable, PHI-safe reason codes for provider protocol failures.
+/// Stable, content-free reason codes for provider protocol failures.
+///
+/// A reason code identifies what went wrong structurally and never carries
+/// prompt, generated, tool, or image content, so a caller may log or surface
+/// one without inspecting it for sensitive data.
 public enum CoreAIProtocolFailure: String, Codable, Sendable {
     case missingChatTemplate
     case incompatibleChatTemplate
