@@ -302,8 +302,29 @@ package struct CoreAIStreamingOutputDecoder {
         }
     }
 
+    /// The markers an envelope header is built from. Each is a special token
+    /// that never occurs in prose, so one appearing inside a body means the
+    /// model repeated its header without terminating the envelope — protocol,
+    /// never content.
+    private var envelopeHeaderMarkers: [String] {
+        switch profile {
+        case .harmony: ["<|start|>", "<|channel|>", Self.envelopeHeaderEnd]
+        case .atem: ["<|start|>", Self.envelopeHeaderEnd]
+        case .plainChat, .qwen35XML, .gemma4Channels: []
+        }
+    }
+
     /// One vocabulary per phase, driving both matching and hold-back so the
     /// two cannot drift — the discipline `pendingMarkers` applies inline.
+    ///
+    /// A body whose text reaches the caller watches the header markers as well
+    /// as the terminators, for the same reason `pendingMarkers` watches a
+    /// profile's whole vocabulary inline: a marker in the wrong position must
+    /// be held back and reported, not streamed out raw. Without them a model
+    /// that repeats its header mid-body — `…<|message|>A<|start|>assistant`
+    /// `<|channel|>final<|message|>B<|return|>` — yields one `.response` event
+    /// carrying two literal headers, and `assertOrdered` never runs because no
+    /// terminator was seen.
     ///
     /// Inside a buffered tool body only the terminators matter: that text
     /// never reaches the caller, so marker-like bytes in tool arguments are
@@ -311,7 +332,10 @@ package struct CoreAIStreamingOutputDecoder {
     private var pendingEnvelopeMarkers: [String] {
         switch envelopePhase {
         case .header: [Self.envelopeHeaderEnd]
-        case .body: envelopeTerminators
+        case .body(.response), .body(.reasoning):
+            envelopeTerminators + envelopeHeaderMarkers
+        case .body(.toolArguments), .body(.toolMarkup):
+            envelopeTerminators
         }
     }
 
@@ -338,6 +362,13 @@ package struct CoreAIStreamingOutputDecoder {
                 envelopePhase = .body(target)
             case .body(let target):
                 if let match = scanner.firstSettledMatch(of: markers, isFinal: isFinal) {
+                    // A header marker inside a body is a repeated header, the
+                    // envelope equivalent of the misplaced inline delimiters
+                    // `transition(on:into:)` rejects. The scanner already held
+                    // it back, so nothing of it reached the caller.
+                    guard envelopeTerminators.contains(match.marker) else {
+                        throw failure(.malformedChannel)
+                    }
                     let body = scanner.takeUpTo(match.range)
                     events += try flushBody(body, to: target, terminatedBy: match.marker)
                     envelopePhase = .header

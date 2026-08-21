@@ -136,6 +136,83 @@ struct EnvelopeDecoderTests {
         }
     }
 
+    // MARK: - Header markers inside a body
+
+    // An envelope body used to watch only its terminators, so a model that
+    // repeated its header without terminating the envelope had that header
+    // appended to `.response` verbatim. `assertOrdered` cannot catch it: it
+    // runs only once a terminator has been seen. `<|start|>`, `<|channel|>`
+    // and `<|message|>` are special tokens that never occur in prose, so
+    // there is no content they could legitimately be.
+
+    @Test("A header repeated inside a body is rejected, not streamed as response text")
+    func repeatedHeaderInsideBodyFails() {
+        #expect(
+            throws: CoreAIProtocolError(profile: .harmony, failure: .malformedChannel)
+        ) {
+            try drain(
+                profile: .harmony, reasoningEnabled: true,
+                deltas: [
+                    "<|start|>assistant<|channel|>final<|message|>first"
+                        + "<|start|>assistant<|channel|>final<|message|>second<|return|>"
+                ])
+        }
+    }
+
+    @Test("The repeated header is held back rather than streamed ahead of the failure")
+    func repeatedHeaderIsHeldBack() throws {
+        var decoder = CoreAIStreamingOutputDecoder(profile: .harmony, reasoningEnabled: true)
+        var events = try decoder.consume("<|start|>assistant<|channel|>final<|message|>first")
+        #expect(events == [.response("first")], "body text still streams as produced")
+        #expect(
+            throws: CoreAIProtocolError(profile: .harmony, failure: .malformedChannel)
+        ) {
+            events += try decoder.consume("<|start|>assistant<|channel|>final<|message|>second")
+        }
+        // The only thing the caller ever saw is the body text. No fragment of
+        // either marker was released while the scanner was matching it.
+        #expect(events == [.response("first")])
+    }
+
+    @Test("A lone <|message|> inside a body is rejected")
+    func strayMessageMarkerInsideBodyFails() {
+        #expect(
+            throws: CoreAIProtocolError(profile: .harmony, failure: .malformedChannel)
+        ) {
+            try drain(
+                profile: .harmony, reasoningEnabled: true,
+                deltas: ["<|start|>assistant<|channel|>final<|message|>a<|message|>b<|return|>"])
+        }
+    }
+
+    @Test("ATEM rejects a header repeated inside a body")
+    func atemRepeatedHeaderInsideBodyFails() {
+        #expect(
+            throws: CoreAIProtocolError(profile: .atem, failure: .malformedChannel)
+        ) {
+            try drain(
+                profile: .atem, reasoningEnabled: true,
+                deltas: [
+                    "<|start|>assistant to=user<|message|>first"
+                        + "<|start|>assistant to=user<|message|>second<|eot|>"
+                ])
+        }
+    }
+
+    @Test("A reasoning body rejects a repeated header too")
+    func repeatedHeaderInsideReasoningBodyFails() {
+        #expect(
+            throws: CoreAIProtocolError(profile: .harmony, failure: .malformedChannel)
+        ) {
+            try drain(
+                profile: .harmony, reasoningEnabled: true,
+                deltas: [
+                    "<|start|>assistant<|channel|>analysis<|message|>weighing"
+                        + "<|start|>assistant<|channel|>analysis<|message|>more<|end|>"
+                ])
+        }
+    }
+
     @Test("Tool recipient buffers until the envelope terminates")
     func toolRecipientBuffers() throws {
         var decoder = CoreAIStreamingOutputDecoder(profile: .harmony, reasoningEnabled: false)
