@@ -151,8 +151,7 @@ package struct CoreAIStreamingOutputDecoder {
 
     private func jsonToolEvents(
         from payload: String,
-        startingAt start: Int,
-        argumentsKey: String = "arguments"
+        startingAt start: Int
     ) throws -> [Event] {
         guard let data = payload.trimmingCharacters(in: .whitespacesAndNewlines)
             .data(using: .utf8),
@@ -168,7 +167,7 @@ package struct CoreAIStreamingOutputDecoder {
             guard let name = source["name"] as? String, isValidName(name) else {
                 throw failure(.malformedToolCall)
             }
-            let args = source[argumentsKey] ?? source["arguments"] ?? [:]
+            let args = source["arguments"] ?? [:]
             guard JSONSerialization.isValidJSONObject(args) else {
                 throw failure(.malformedToolCall)
             }

@@ -91,9 +91,7 @@ package struct CoreAITranscriptCodec {
                 guard profile.supportsToolCalling, !toolCalls.isEmpty else {
                     throw failure(.unsupportedTranscriptContent)
                 }
-                let calls = try toolCalls.enumerated().map { index, call in
-                    try toolCallMessage(call, index: index)
-                }
+                let calls = try toolCalls.map(toolCallMessage)
                 var message: Message = [
                     "role": "assistant",
                     "content": "" as any Sendable,
@@ -109,7 +107,7 @@ package struct CoreAITranscriptCodec {
                 }
                 messages.append([
                     "role": toolOutputRole,
-                    "tool_call_id": normalizedToolCallID(output.id, index: messages.count),
+                    "tool_call_id": normalizedToolCallID(output.id),
                     "name": output.toolName,
                     "content": try textOnly(output.segments),
                 ])
@@ -230,17 +228,21 @@ package struct CoreAITranscriptCodec {
 
     private func attach(reasoning: String?, to message: inout Message) {
         guard let reasoning else { return }
+        message[reasoningMessageKey] = reasoning
+    }
+
+    /// The single source of truth for which transcript key carries reasoning
+    /// content for the selected profile. Used by both live encoding and
+    /// template-validation fixtures so the two can never diverge.
+    private var reasoningMessageKey: String {
         switch profile {
-        case .harmony:
-            message["thinking"] = reasoning
-        case .plainChat, .qwen35XML, .gemma4Channels, .atem:
-            message["reasoning_content"] = reasoning
+        case .harmony: "thinking"
+        case .plainChat, .qwen35XML, .gemma4Channels, .atem: "reasoning_content"
         }
     }
 
     private func toolCallMessage(
-        _ call: Transcript.ToolCall,
-        index: Int
+        _ call: Transcript.ToolCall
     ) throws -> [String: any Sendable] {
         guard let arguments = Self.sendableJSONObject(from: call.arguments.jsonString) as? [String: any Sendable]
         else { throw failure(.invalidPriorToolCall) }
@@ -249,7 +251,7 @@ package struct CoreAITranscriptCodec {
             "arguments": arguments,
         ]
         return [
-            "id": normalizedToolCallID(call.id, index: index),
+            "id": normalizedToolCallID(call.id),
             "type": "function",
             "function": function,
         ]
@@ -259,7 +261,7 @@ package struct CoreAITranscriptCodec {
         "tool"
     }
 
-    private func normalizedToolCallID(_ id: String, index: Int) -> String {
+    private func normalizedToolCallID(_ id: String) -> String {
         id
     }
 
@@ -284,8 +286,7 @@ package struct CoreAITranscriptCodec {
             "content": "synthetic-response",
         ]
         if profile.supportsReasoning {
-            if profile == .harmony { assistant["thinking"] = "synthetic-reasoning" }
-            else { assistant["reasoning_content"] = "synthetic-reasoning" }
+            assistant[reasoningMessageKey] = "synthetic-reasoning"
         }
         if profile.supportsToolCalling {
             assistant["content"] = ""
