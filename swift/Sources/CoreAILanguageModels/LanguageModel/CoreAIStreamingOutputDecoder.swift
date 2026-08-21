@@ -54,12 +54,7 @@ package struct CoreAIStreamingOutputDecoder {
     // MARK: - Plain profiles
 
     private func parsePlain(_ text: String) throws -> [Event] {
-        let reserved = [
-            "<think>", "</think>", "<tool_call>", "</tool_call>",
-            "[TOOL_CALLS]", "<|python_tag|>", "<|channel|>",
-            "<|channel>", "<atem:function_calls>",
-        ]
-        guard !reserved.contains(where: text.contains) else {
+        guard !CoreAITranscriptCodec.reservedMarkers.contains(where: text.contains) else {
             throw failure(.malformedChannel)
         }
         return text.isEmpty ? [] : [.response(text)]

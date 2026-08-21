@@ -46,9 +46,7 @@ package struct CoreAITranscriptCodec {
         guard !tokens.isEmpty else { throw failure(.incompatibleChatTemplate) }
 
         let rendered = tokenizer.decode(tokens: tokens)
-        guard templateEvidence.allSatisfy(rendered.contains) else {
-            throw failure(.incompatibleChatTemplate)
-        }
+        try assertEvidence(in: rendered)
     }
 
     package func encode(
@@ -329,13 +327,65 @@ package struct CoreAITranscriptCodec {
         ] as [String: any Sendable],
     ]
 
-    private var templateEvidence: [String] {
+    /// Every marker owned by a structural profile. Selecting `plainChat` for
+    /// an artifact whose template emits any of these is rejected at load
+    /// rather than at first generation.
+    package static let reservedMarkers: [String] = [
+        "<think>", "</think>",
+        "<function=", "<parameter=",
+        "<|channel|>", "<|channel>", "<channel|>",
+        "<|tool_call>", "<tool_call|>",
+        "<|start|>", "<|message|>", "<|end|>", "<|return|>", "<|call|>",
+        "<|eom|>", "<|eot|>",
+        "<atem:function_calls>",
+    ]
+
+    /// Strings proving the template rendered reasoning content. Empty only
+    /// for profiles that do not advertise reasoning.
+    package var reasoningEvidence: [String] {
+        switch profile {
+        case .plainChat: []
+        case .qwen35XML: ["<think>", "synthetic-reasoning"]
+        case .harmony: ["<|channel|>analysis", "synthetic-reasoning"]
+        case .gemma4Channels: ["<|channel>thought", "synthetic-reasoning"]
+        case .atem: ["to=self", "synthetic-reasoning"]
+        }
+    }
+
+    /// Strings proving the template rendered tool definitions, a tool call,
+    /// and a prior tool result. Empty only for profiles without tools.
+    package var toolEvidence: [String] {
         switch profile {
         case .plainChat: []
         case .qwen35XML: ["<function=synthetic.tool>", "<parameter=value>", "synthetic-result"]
-        case .harmony: ["<|channel|>analysis", "to=functions.synthetic.tool", "synthetic-result"]
-        case .gemma4Channels: ["<|channel>thought", "<|tool_call>call:synthetic.tool", "synthetic-result"]
-        case .atem: ["to=self", "<atem:function_calls>", "synthetic-result"]
+        case .harmony: ["to=functions.synthetic.tool", "synthetic-result"]
+        case .gemma4Channels: ["<|tool_call>call:synthetic.tool", "synthetic-result"]
+        case .atem: ["<atem:function_calls>", "synthetic-result"]
+        }
+    }
+
+    /// Strings proving the template rendered ordinary roles and content.
+    private var contentEvidence: [String] {
+        ["synthetic-system", "synthetic-user", "synthetic-response"]
+    }
+
+    package var templateEvidence: [String] {
+        switch profile {
+        case .plainChat: contentEvidence
+        case .qwen35XML, .harmony, .gemma4Channels, .atem:
+            reasoningEvidence + toolEvidence
+        }
+    }
+
+    /// Asserts the rendered fixture carries every required string, and for
+    /// `plainChat` that it carries no structural marker at all.
+    package func assertEvidence(in rendered: String) throws {
+        guard templateEvidence.allSatisfy(rendered.contains) else {
+            throw failure(.incompatibleChatTemplate)
+        }
+        if profile == .plainChat,
+            Self.reservedMarkers.contains(where: rendered.contains) {
+            throw failure(.incompatibleChatTemplate)
         }
     }
 
