@@ -30,6 +30,22 @@ struct ValidatedLanguageGraphABI {
     let valueCache: LanguageGraphLayout.Tensor
     let persistentStates: [LanguageGraphLayout.Tensor]
 
+    /// How each validated state is handled downstream.
+    ///
+    /// Deliberately only `.kvCache` and `.fixed`. `StateKind.slidingCache`
+    /// exists and `StateHandlerFactory` still honours it, but nothing here can
+    /// produce it, and that is a decision rather than an oversight: a sliding
+    /// window cache and a conv or recurrent state are both fixed-shape, so
+    /// telling them apart needs a declaration, and the only declarations
+    /// available were the model-family name guesses this provider exists to
+    /// delete (`name.contains("cache")`). Until a bundle can *declare* a
+    /// sliding cache, every non-KV state is classified `.fixed`, which sets
+    /// `hasNonTruncatableStates` and forces full reset instead of prefix
+    /// reuse — correct but pessimistic for a hybrid or sliding-window model.
+    ///
+    /// `slidingCacheIsUnreachable` in the ABI tests pins this, so restoring
+    /// the capability is a deliberate change to a failing test rather than a
+    /// silent one.
     var stateKinds: [String: StateKind] {
         var kinds = [keyCache.name: StateKind.kvCache, valueCache.name: .kvCache]
         for state in persistentStates {
@@ -39,46 +55,77 @@ struct ValidatedLanguageGraphABI {
     }
 }
 
+/// The slice of a compiled function's descriptor the language graph ABI reads.
+///
+/// `InferenceFunctionDescriptor` and `NDArrayDescriptor` have no accessible
+/// initializers, so the production entry point below could not be driven by a
+/// test at all while it took one directly. A tensor that is not an NDArray
+/// surfaces here as `nil` and `validate` turns that into the typed rejection,
+/// which leaves only the one-line enum destructuring in the conformance
+/// outside test reach.
+protocol LanguageGraphFunctionDescriptor {
+    var inputNames: [String] { get }
+    var outputNames: [String] { get }
+    var stateNames: [String] { get }
+    func ndArrayInput(named name: String) -> LanguageGraphLayout.Tensor?
+    func ndArrayOutput(named name: String) -> LanguageGraphLayout.Tensor?
+    func ndArrayState(named name: String) -> LanguageGraphLayout.Tensor?
+}
+
+extension InferenceFunctionDescriptor: LanguageGraphFunctionDescriptor {
+    func ndArrayInput(named name: String) -> LanguageGraphLayout.Tensor? {
+        Self.tensor(named: name, from: inputDescriptor(of: name))
+    }
+
+    func ndArrayOutput(named name: String) -> LanguageGraphLayout.Tensor? {
+        Self.tensor(named: name, from: outputDescriptor(of: name))
+    }
+
+    func ndArrayState(named name: String) -> LanguageGraphLayout.Tensor? {
+        Self.tensor(named: name, from: stateDescriptor(of: name))
+    }
+
+    private static func tensor(
+        named name: String,
+        from descriptor: InferenceValue.Descriptor?
+    ) -> LanguageGraphLayout.Tensor? {
+        guard case .ndArray(let value) = descriptor else { return nil }
+        return LanguageGraphLayout.Tensor(
+            name: name,
+            scalarType: value.scalarType,
+            shape: value.shape
+        )
+    }
+}
+
 enum LanguageGraphABI {
     static func validate(
-        descriptor: InferenceFunctionDescriptor,
+        descriptor: some LanguageGraphFunctionDescriptor,
         expectedVocabSize: Int
     ) throws -> ValidatedLanguageGraphABI {
         let inputs = try descriptor.inputNames.map { name in
-            guard case .ndArray(let value) = descriptor.inputDescriptor(of: name) else {
+            guard let tensor = descriptor.ndArrayInput(named: name) else {
                 throw InferenceRuntimeError.invalidInputType(
                     "Language graph input is not an NDArray"
                 )
             }
-            return LanguageGraphLayout.Tensor(
-                name: name,
-                scalarType: value.scalarType,
-                shape: value.shape
-            )
+            return tensor
         }
         let outputs = try descriptor.outputNames.map { name in
-            guard case .ndArray(let value) = descriptor.outputDescriptor(of: name) else {
+            guard let tensor = descriptor.ndArrayOutput(named: name) else {
                 throw InferenceRuntimeError.invalidOutputType(
                     "Language graph output is not an NDArray"
                 )
             }
-            return LanguageGraphLayout.Tensor(
-                name: name,
-                scalarType: value.scalarType,
-                shape: value.shape
-            )
+            return tensor
         }
         let states = try descriptor.stateNames.map { name in
-            guard case .ndArray(let value) = descriptor.stateDescriptor(of: name) else {
+            guard let tensor = descriptor.ndArrayState(named: name) else {
                 throw InferenceRuntimeError.invalidOutputType(
                     "Language graph state is not an NDArray"
                 )
             }
-            return LanguageGraphLayout.Tensor(
-                name: name,
-                scalarType: value.scalarType,
-                shape: value.shape
-            )
+            return tensor
         }
         let layout = LanguageGraphLayout(
             inputs: inputs,
@@ -139,6 +186,26 @@ enum LanguageGraphABI {
         else {
             throw InferenceRuntimeError.invalidOutputType(
                 "Language graph logits must have shape [1, sequence, configured vocabulary]"
+            )
+        }
+
+        // The KV pair is identified by shape, not by position. Taking
+        // `states[0]` and `states[1]` on trust bound whatever the exporter
+        // happened to emit first: a graph that lists a fixed conv state first
+        // had that state bound as its KV cache and the real cache demoted to a
+        // persistent state, with garbage output and no error anywhere. A
+        // dynamic dimension is what makes a state a growing cache, and the
+        // persistent states are required to be fixed just below, so requiring
+        // the dynamically shaped states to be exactly the first two states
+        // makes the ordering a checked property instead of an exporter
+        // accident.
+        let dynamicStateIndices = layout.states.indices.filter { index in
+            !dynamicDimensions(in: layout.states[index].shape).isEmpty
+        }
+        guard dynamicStateIndices == [0, 1] else {
+            throw InferenceRuntimeError.invalidOutputType(
+                "Language graph requires its two dynamically shaped KV states to be the "
+                    + "first two states"
             )
         }
 
