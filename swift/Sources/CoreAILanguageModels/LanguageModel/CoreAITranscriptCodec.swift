@@ -332,6 +332,7 @@ package struct CoreAITranscriptCodec {
     /// rather than at first generation.
     package static let reservedMarkers: [String] = [
         "<think>", "</think>",
+        "<tool_call>", "</tool_call>",
         "<function=", "<parameter=",
         "<|channel|>", "<|channel>", "<channel|>",
         "<|tool_call>", "<tool_call|>",

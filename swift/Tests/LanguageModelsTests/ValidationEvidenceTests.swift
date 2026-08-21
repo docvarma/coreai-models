@@ -49,6 +49,28 @@ struct ValidationEvidenceTests {
         }
     }
 
+    @Test("Reserved markers cover every shipping profile's live markers")
+    func reservedMarkersCoverShippingProfiles() {
+        // Asserting concrete markers, not iterating the list itself: a test
+        // that loops over `reservedMarkers` can never fail on an omission.
+        let required = [
+            "<think>", "</think>",              // qwen35XML reasoning
+            "<tool_call>", "</tool_call>",      // qwen35XML tool block
+            "<function=", "<parameter=",        // qwen35XML call body
+            "<|channel|>",                      // harmony channels
+            "<|channel>", "<channel|>",         // gemma4Channels thought
+            "<|tool_call>", "<tool_call|>",     // gemma4Channels tool block
+            "<|start|>", "<|message|>",         // harmony + atem envelopes
+            "<|end|>", "<|return|>", "<|call|>",
+            "<|eom|>", "<|eot|>",
+            "<atem:function_calls>",
+        ]
+        let actual = Set(CoreAITranscriptCodec.reservedMarkers)
+        for marker in required {
+            #expect(actual.contains(marker), "reservedMarkers is missing \(marker)")
+        }
+    }
+
     @Test("plainChat accepts a clean template")
     func plainChatAcceptsCleanTemplate() throws {
         let codec = CoreAITranscriptCodec(profile: .plainChat)
