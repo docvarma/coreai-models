@@ -401,7 +401,7 @@ package struct CoreAIStreamingOutputDecoder {
     /// Classifies one complete envelope header, using the spellings the batch
     /// parsers matched on: harmony puts the recipient *before* the channel
     /// (`<|start|>assistant to=functions.NAME<|channel|>commentary`), atem puts
-    /// it directly after the role (`<|start|>assistant to=user`). A recipient
+    /// it first, with no role prefix at all (`to=user`). A recipient
     /// wins over a channel name. Anything else is a protocol violation rather
     /// than text, so it is never streamed to the caller.
     ///
@@ -411,11 +411,11 @@ package struct CoreAIStreamingOutputDecoder {
     private func classify(header rawHeader: String) throws -> Destination {
         // Whitespace between envelopes belongs to no message.
         let header = String(rawHeader.drop(while: { $0.isWhitespace }))
-        let role = "<|start|>assistant"
-        guard header.hasPrefix(role) else { throw failure(.malformedChannel) }
-        let remainder = String(header.dropFirst(role.count))
         switch profile {
         case .harmony:
+            let role = "<|start|>assistant"
+            guard header.hasPrefix(role) else { throw failure(.malformedChannel) }
+            let remainder = String(header.dropFirst(role.count))
             if remainder == "<|channel|>analysis" { return try reasoningDestination() }
             if remainder == "<|channel|>final" { return .response }
             let recipient = " to=functions."
@@ -429,9 +429,12 @@ package struct CoreAIStreamingOutputDecoder {
             }
             throw failure(.malformedChannel)
         case .atem:
-            let recipient = " to="
-            guard remainder.hasPrefix(recipient) else { throw failure(.malformedChannel) }
-            switch String(remainder.dropFirst(recipient.count)) {
+            // An ATEM message opens directly with its recipient and carries no
+            // role prefix: `to=self` is reasoning, `to=user` is the response,
+            // any other recipient is a tool call.
+            let recipient = "to="
+            guard header.hasPrefix(recipient) else { throw failure(.malformedChannel) }
+            switch String(header.dropFirst(recipient.count)) {
             case "self": return try reasoningDestination()
             case "user": return .response
             default: return .toolMarkup

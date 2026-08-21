@@ -54,8 +54,8 @@ struct EnvelopeDecoderTests {
         + "<|message|>{\"value\":1}<|call|>"
 
     private let atemWhole =
-        "<|start|>assistant to=self<|message|>thinking<|eom|>"
-        + "<|start|>assistant to=user<|message|>done<|eot|>"
+        "to=self<|message|>thinking<|eom|>"
+        + "to=user<|message|>done<|eot|>"
 
     @Test("Final-channel body streams before its terminator arrives")
     func finalBodyStreamsEarly() throws {
@@ -69,8 +69,8 @@ struct EnvelopeDecoderTests {
     @Test("ATEM user body streams before its terminator arrives")
     func atemUserBodyStreamsEarly() throws {
         var decoder = CoreAIStreamingOutputDecoder(profile: .atem, reasoningEnabled: true)
-        _ = try decoder.consume("<|start|>assistant to=self<|message|>thinking<|eom|>")
-        _ = try decoder.consume("<|start|>assistant to=user<|message|>")
+        _ = try decoder.consume("to=self<|message|>thinking<|eom|>")
+        _ = try decoder.consume("to=user<|message|>")
         let events = try decoder.consume("do")
         #expect(events == [.response("do")], "the body must not wait for <|eot|>")
     }
@@ -96,6 +96,25 @@ struct EnvelopeDecoderTests {
             offsetsChecked += 1
         }
         #expect(offsetsChecked == harmonyWhole.count - 1)
+    }
+
+    @Test("ATEM headers carry no role prefix")
+    func atemHeaderHasNoRolePrefix() throws {
+        // Adopted from upstream apple/coreai-models #182, which reads an ATEM
+        // message as opening directly with its recipient. No obtainable Muse
+        // Glimmer artifact can arbitrate between that and a role-prefixed
+        // reading, so the alternative must fail closed rather than stream
+        // protocol markup to the caller.
+        let events = try drain(
+            profile: .atem, reasoningEnabled: true,
+            deltas: ["to=user<|message|>answer<|eot|>"])
+        #expect(events == [.response("answer")])
+
+        #expect(throws: CoreAIProtocolError(profile: .atem, failure: .malformedChannel)) {
+            try drain(
+                profile: .atem, reasoningEnabled: true,
+                deltas: ["<|start|>assistant to=user<|message|>answer<|eot|>"])
+        }
     }
 
     @Test("ATEM markers split across every interior offset yield identical events")
@@ -193,8 +212,8 @@ struct EnvelopeDecoderTests {
             try drain(
                 profile: .atem, reasoningEnabled: true,
                 deltas: [
-                    "<|start|>assistant to=user<|message|>first"
-                        + "<|start|>assistant to=user<|message|>second<|eot|>"
+                    "to=user<|message|>first"
+                        + "to=user<|message|>second<|eot|>"
                 ])
         }
     }
@@ -253,7 +272,7 @@ struct EnvelopeDecoderTests {
     @Test("ATEM tool envelope dispatches its markup calls at the terminator")
     func atemToolCallEmittedWhenComplete() throws {
         let whole =
-            "<|start|>assistant to=functions<|message|><atem:function_calls>"
+            "to=functions<|message|><atem:function_calls>"
             + "<atem:invoke name=\"synthetic.tool\">"
             + "<atem:parameter name=\"value\">1</atem:parameter>"
             + "</atem:invoke></atem:function_calls><|eom|>"
