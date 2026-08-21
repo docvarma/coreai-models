@@ -69,15 +69,36 @@ package struct CoreAIStreamingOutputDecoder {
     package mutating func consume(_ delta: String) throws -> [Event] {
         scanner.append(delta)
         switch mode {
-        case .inline: return try drainInline(isFinal: false)
-        case .envelope: return try drainEnvelope(isFinal: false)
+        case .inline: return try drainInline(isFinal: false, truncated: false)
+        case .envelope: return try drainEnvelope(isFinal: false, truncated: false)
         }
     }
 
-    package mutating func finish() throws -> [Event] {
+    /// Ends the stream.
+    ///
+    /// - Parameter truncated: Whether the caller cut generation short — the
+    ///   token cap was reached, the request was cancelled, or the engine
+    ///   stopped for any reason other than the model emitting an end-of-turn
+    ///   token. An unterminated block means two different things in the two
+    ///   cases, and only the caller knows which happened.
+    ///
+    ///   `false` (the model chose to stop): an open block is a protocol
+    ///   violation and raises `unfinishedReasoning` / `unfinishedToolCall`, as
+    ///   Tasks 5 and 6 established. `true` (we cut it off): an open block is
+    ///   ordinary truncation. Content already routed to a caller-visible
+    ///   destination has been emitted by the drain above; what remains open is
+    ///   closed out without a failure, so a long chain-of-thought that runs
+    ///   into the cap yields its partial reasoning instead of destroying the
+    ///   whole response. A partially buffered tool call is still dropped —
+    ///   half a call cannot be dispatched — which is what the superseded
+    ///   `ToolCallParser.flush()` did with an unclosed block.
+    ///
+    ///   There is deliberately no default: forgetting the argument would
+    ///   silently reinstate the strict behavior on a truncated stream.
+    package mutating func finish(truncated: Bool) throws -> [Event] {
         switch mode {
-        case .inline: return try drainInline(isFinal: true)
-        case .envelope: return try drainEnvelope(isFinal: true)
+        case .inline: return try drainInline(isFinal: true, truncated: truncated)
+        case .envelope: return try drainEnvelope(isFinal: true, truncated: truncated)
         }
     }
 
@@ -159,7 +180,7 @@ package struct CoreAIStreamingOutputDecoder {
 
     // MARK: - Inline drain
 
-    private mutating func drainInline(isFinal: Bool) throws -> [Event] {
+    private mutating func drainInline(isFinal: Bool, truncated: Bool) throws -> [Event] {
         var events: [Event] = []
         while true {
             let markers = pendingMarkers
@@ -170,8 +191,18 @@ package struct CoreAIStreamingOutputDecoder {
                 continue
             }
             let safe = scanner.takeSafe(waitingFor: markers, isFinal: isFinal)
+            // `emit` routes by current state, so a truncated reasoning body has
+            // already gone out as `.reasoning` by the time we get here; only
+            // the assertion distinguishes truncation from a violation.
             events += try emit(safe)
-            if isFinal { try assertClosed() }
+            if isFinal {
+                if truncated {
+                    blockBuffer = ""
+                    state = .text
+                } else {
+                    try assertClosed()
+                }
+            }
             return events
         }
     }
@@ -286,7 +317,7 @@ package struct CoreAIStreamingOutputDecoder {
 
     // MARK: - Envelope drain
 
-    private mutating func drainEnvelope(isFinal: Bool) throws -> [Event] {
+    private mutating func drainEnvelope(isFinal: Bool, truncated: Bool) throws -> [Event] {
         var events: [Event] = []
         while true {
             let markers = pendingEnvelopeMarkers
@@ -299,7 +330,7 @@ package struct CoreAIStreamingOutputDecoder {
                     guard isFinal else { return events }
                     let remainder = scanner.takeAll()
                         .trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !remainder.isEmpty { throw failure(.malformedChannel) }
+                    if !remainder.isEmpty, !truncated { throw failure(.malformedChannel) }
                     return events
                 }
                 let target = try classify(header: scanner.takeUpTo(match.range))
@@ -313,8 +344,11 @@ package struct CoreAIStreamingOutputDecoder {
                     continue
                 }
                 let safe = scanner.takeSafe(waitingFor: markers, isFinal: isFinal)
+                // `flushBody` has already emitted response and reasoning text;
+                // a tool body stays buffered and is dropped with the decoder.
                 events += try flushBody(safe, to: target, terminatedBy: nil)
-                if isFinal { throw failure(unfinished(target)) }
+                if isFinal, !truncated { throw failure(unfinished(target)) }
+                if isFinal { blockBuffer = "" }
                 return events
             }
         }

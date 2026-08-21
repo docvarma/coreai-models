@@ -249,12 +249,13 @@ public struct CoreAILanguageModel: LanguageModel {
                 // rather than quietly generating a thought block anyway.
                 reasoning = try model.codec.reasoningConfiguration(
                     for: request.contextOptions.reasoningLevel)
-                promptTokens = try model.codec.encode(
+                let encoded = try model.codec.encode(
                     entries: Array(request.transcript),
                     tools: request.enabledToolDefinitions,
                     reasoning: reasoning,
-                    using: model.tokenizer
-                ).tokens
+                    using: model.tokenizer)
+                try Self.assertTextOnly(encoded, profile: model.protocolProfile)
+                promptTokens = encoded.tokens
             } catch {
                 tokenizationSpan.end()
                 throw error
@@ -428,10 +429,12 @@ public struct CoreAILanguageModel: LanguageModel {
             }
 
             // Flush the decoder — drains any content held back waiting for a
-            // marker. Without this, content right at the EOS boundary (or
-            // inside an unclosed block) would be lost; an unterminated block
-            // is reported here rather than silently dropped.
-            for event in try decoder.finish() {
+            // marker. Without this, content right at the EOS boundary would be
+            // lost. An unterminated block is a protocol violation only when the
+            // model chose to stop; when the token cap, a cancellation, or an
+            // engine error cut it off, it is truncation and the partial content
+            // is flushed instead of failing the whole response.
+            for event in try decoder.finish(truncated: Self.isTruncated(tokenStream.stopReason)) {
                 if case .reasoning = event { reasoningTokenCount += 1 }
                 await Self.dispatch(event, to: channel)
             }
@@ -451,19 +454,31 @@ public struct CoreAILanguageModel: LanguageModel {
             await Task.yield()
         }
 
+        // MARK: - Stop reason
+
+        /// Whether the generation was cut short by us rather than ended by the
+        /// model. Only an end-of-sequence token means the model chose to stop;
+        /// `.maxTokens`, `.cancelled` and `.error` are all our budget running
+        /// out, and `.stopSequence` is a caller-supplied cut, not an
+        /// end-of-turn. A `nil` reason (iteration never ran) is treated as
+        /// truncation too — the safe direction, since the strict reading turns
+        /// an ordinary short generation into a hard failure.
+        static func isTruncated(_ stopReason: StopReason?) -> Bool {
+            stopReason != .eos
+        }
+
         // MARK: - Event Dispatch
 
-        /// Routes a decoder event to the matching FoundationModels channel
-        /// event. Response text becomes `.response(...).appendText`, reasoning
-        /// becomes a top-level `.reasoning(...).appendText`, and a completed
-        /// call becomes `.toolCalls(...).toolCall`. Reasoning is a sibling of
-        /// response/tool-calls in this API (not nested under response) because
-        /// at decode time we do not yet know whether the model will follow the
-        /// thought block with a response or a tool call.
+        /// Sends one decoder event on the channel. Shared with the vision
+        /// adapter so both adapters stream identically.
         ///
-        /// Empty text is dropped rather than sent, matching what the superseded
-        /// parsers emitted. Shared with the vision adapter so both adapters
-        /// stream identically.
+        /// The routing decision itself lives in `CoreAIChannelRouting`, which is
+        /// plain `Equatable` data and therefore testable;
+        /// `LanguageModelExecutorGenerationChannel.Event` is an opaque struct
+        /// with no readable properties, so a test can never inspect what was
+        /// sent. Everything that could be wrong — which arm an event takes, and
+        /// whether an empty fragment is suppressed — is decided before this
+        /// function, leaving three unconditional sends.
         ///
         /// We deliberately do not pass `entryID` — FoundationModels threads
         /// entry identity itself based on event ordering.
@@ -471,18 +486,18 @@ public struct CoreAILanguageModel: LanguageModel {
             _ event: CoreAIStreamingOutputDecoder.Event,
             to channel: LanguageModelExecutorGenerationChannel
         ) async {
-            switch event {
-            case .reasoning(let text):
-                guard !text.isEmpty else { return }
+            switch CoreAIChannelRouting(event) {
+            case .drop:
+                return
+            case .appendReasoningText(let text):
                 await channel.send(
                     .reasoning(action: .appendText(text, tokenCount: 1))
                 )
-            case .response(let text):
-                guard !text.isEmpty else { return }
+            case .appendResponseText(let text):
                 await channel.send(
                     .response(action: .appendText(text, tokenCount: 1))
                 )
-            case .toolCall(let id, let name, let argumentsJSON):
+            case .appendToolCallArguments(let id, let name, let argumentsJSON):
                 // Arguments are model-generated content and are never logged.
                 CLILogger.log(
                     "Dispatching tool call id=\(id) name=\(name)",
@@ -571,6 +586,24 @@ public struct CoreAILanguageModel: LanguageModel {
 
         // MARK: - Transcript inspection
 
+        /// The text adapter has no image pipeline: it forwards only
+        /// `EncodedTranscript.tokens` and drops `images`. The codec renders a
+        /// prompt holding an attachment as a multi-part `[{"type":"text"},
+        /// {"type":"image"}]` content array, which a text-only Jinja template
+        /// will happily stringify rather than reject — so an image reaching
+        /// this adapter would be silently mis-rendered rather than silently
+        /// dropped. Reject it instead. Images belong to
+        /// `CoreAIVisionLanguageModel`.
+        static func assertTextOnly(
+            _ encoded: CoreAITranscriptCodec.EncodedTranscript,
+            profile: CoreAILanguageProtocolProfile
+        ) throws {
+            guard encoded.images.isEmpty else {
+                throw CoreAIProtocolError(
+                    profile: profile, failure: .unsupportedTranscriptContent)
+            }
+        }
+
         private static func attachmentCount(in transcript: Transcript) -> Int {
             transcript.reduce(into: 0) { count, entry in
                 let segments: [Transcript.Segment]
@@ -597,6 +630,37 @@ public struct CoreAILanguageModel: LanguageModel {
                 return SamplingConfiguration(temperature: temperature)
             }
             return base
+        }
+    }
+}
+
+// MARK: - Channel routing
+
+/// Where one `CoreAIStreamingOutputDecoder.Event` goes on a FoundationModels
+/// generation channel.
+///
+/// This exists so the mapping can be asserted. Response text becomes
+/// `.response(...).appendText`, reasoning becomes a *top-level*
+/// `.reasoning(...).appendText` — a sibling of response and tool calls in this
+/// API, not nested under response, because at decode time we do not yet know
+/// whether the model will follow a thought block with a response or a tool
+/// call — and a completed call becomes `.toolCalls(...).toolCall`. An empty
+/// text fragment is dropped rather than sent, which is what the superseded
+/// `ThinkTagParser` / `ToolCallParser` pair emitted.
+package enum CoreAIChannelRouting: Equatable, Sendable {
+    case drop
+    case appendResponseText(String)
+    case appendReasoningText(String)
+    case appendToolCallArguments(id: String, name: String, argumentsJSON: String)
+
+    package init(_ event: CoreAIStreamingOutputDecoder.Event) {
+        switch event {
+        case .response(let text):
+            self = text.isEmpty ? .drop : .appendResponseText(text)
+        case .reasoning(let text):
+            self = text.isEmpty ? .drop : .appendReasoningText(text)
+        case .toolCall(let id, let name, let argumentsJSON):
+            self = .appendToolCallArguments(id: id, name: name, argumentsJSON: argumentsJSON)
         }
     }
 }

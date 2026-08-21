@@ -287,6 +287,92 @@ struct ReasoningPolicyTests {
     }
 }
 
+@Suite("Text adapter transcript limits")
+struct TextAdapterTranscriptTests {
+    /// Renders any transcript without complaint, so the assertion under test
+    /// is the adapter's own and not the template's.
+    private struct RenderingTokenizer: Tokenizer, Sendable {
+        var hasChatTemplate: Bool { true }
+        var bosToken: String? { nil }
+        var bosTokenId: Int? { nil }
+        var eosToken: String? { nil }
+        var eosTokenId: Int? { nil }
+        var unknownToken: String? { nil }
+        var unknownTokenId: Int? { nil }
+
+        func tokenize(text: String) -> [String] { [text] }
+        func encode(text: String) -> [Int] { [1, 2, 3] }
+        func encode(text: String, addSpecialTokens: Bool) -> [Int] { [1, 2, 3] }
+        func callAsFunction(_ text: String, addSpecialTokens: Bool) -> [Int] { [1, 2, 3] }
+        func decode(tokens: [Int]) -> String { "" }
+        func decode(tokens: [Int], skipSpecialTokens: Bool) -> String { "" }
+        func convertTokenToId(_ token: String) -> Int? { nil }
+        func convertTokensToIds(_ tokens: [String]) -> [Int?] { tokens.map { _ in nil } }
+        func convertIdToToken(_ id: Int) -> String? { nil }
+        func convertIdsToTokens(_ ids: [Int]) -> [String?] { ids.map { _ in nil } }
+
+        func applyChatTemplate(messages: [Message]) throws -> [Int] { [1, 2, 3] }
+        func applyChatTemplate(messages: [Message], tools: [ToolSpec]?) throws -> [Int] { [1, 2, 3] }
+        func applyChatTemplate(
+            messages: [Message], tools: [ToolSpec]?, additionalContext: [String: any Sendable]?
+        ) throws -> [Int] { [1, 2, 3] }
+        func applyChatTemplate(messages: [Message], chatTemplate: ChatTemplateArgument) throws -> [Int] {
+            [1, 2, 3]
+        }
+        func applyChatTemplate(messages: [Message], chatTemplate: String) throws -> [Int] { [1, 2, 3] }
+        func applyChatTemplate(
+            messages: [Message], chatTemplate: ChatTemplateArgument?, addGenerationPrompt: Bool,
+            truncation: Bool, maxLength: Int?, tools: [ToolSpec]?
+        ) throws -> [Int] { [1, 2, 3] }
+        func applyChatTemplate(
+            messages: [Message], chatTemplate: ChatTemplateArgument?, addGenerationPrompt: Bool,
+            truncation: Bool, maxLength: Int?, tools: [ToolSpec]?,
+            additionalContext: [String: any Sendable]?
+        ) throws -> [Int] { [1, 2, 3] }
+    }
+
+    private static func encode(
+        segments: [Transcript.Segment]
+    ) throws -> CoreAITranscriptCodec.EncodedTranscript {
+        let codec = CoreAITranscriptCodec(profile: .plainChat)
+        return try codec.encode(
+            entries: [.prompt(Transcript.Prompt(segments: segments))],
+            tools: [],
+            reasoning: try codec.reasoningConfiguration(for: nil),
+            using: RenderingTokenizer())
+    }
+
+    @Test("A text-only transcript is accepted")
+    func textOnlyTranscriptAccepted() throws {
+        let encoded = try Self.encode(
+            segments: [.text(Transcript.TextSegment(content: "synthetic-user"))])
+        #expect(encoded.images.isEmpty)
+        try CoreAILanguageModel.CoreAIExecutor.assertTextOnly(encoded, profile: .plainChat)
+    }
+
+    @Test("An image reaching the text adapter is rejected, not rendered as a content array")
+    func imageInTextTranscriptRejected() throws {
+        let cgImage = try #require(makeSolidCGImage(r: 10, g: 20, b: 30, side: 2))
+        let encoded = try Self.encode(segments: [
+            .text(Transcript.TextSegment(content: "synthetic-user")),
+            .attachment(
+                Transcript.AttachmentSegment(
+                    content: .image(Transcript.ImageAttachment(cgImage)))),
+        ])
+        // The codec turns an attachment into a multi-part
+        // [{"type":"text"},{"type":"image"}] content array. A text-only Jinja
+        // template stringifies that rather than throwing, so without this
+        // guard the image is silently mis-rendered into the prompt.
+        #expect(encoded.images.count == 1)
+        #expect(
+            throws: CoreAIProtocolError(
+                profile: .plainChat, failure: .unsupportedTranscriptContent)
+        ) {
+            try CoreAILanguageModel.CoreAIExecutor.assertTextOnly(encoded, profile: .plainChat)
+        }
+    }
+}
+
 @Suite("Core AI image orientation")
 struct CoreAIImageOrientationTests {
     @Test("the VLM accepts exactly one image")

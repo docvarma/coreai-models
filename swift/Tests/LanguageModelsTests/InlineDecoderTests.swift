@@ -20,7 +20,7 @@ struct InlineDecoderTests {
             profile: profile, reasoningEnabled: reasoningEnabled)
         var events: [CoreAIStreamingOutputDecoder.Event] = []
         for delta in deltas { events += try decoder.consume(delta) }
-        return events + (try decoder.finish())
+        return events + (try decoder.finish(truncated: false))
     }
 
     /// Chunking decides how many `.response`/`.reasoning` events a run of text
@@ -180,7 +180,7 @@ struct InlineDecoderTests {
         #expect(held.isEmpty)
         let events =
             try decoder.consume("call:synthetic.tool{value: 1}<tool_call|>")
-            + (try decoder.finish())
+            + (try decoder.finish(truncated: false))
         #expect(
             events == [
                 .toolCall(
@@ -236,7 +236,7 @@ struct InlineDecoderTests {
         let responseEvents = try decoder.consume("synthetic-response<|return|>")
         #expect(responseEvents == [.response("synthetic-response")])
         events += responseEvents
-        let trailing = try decoder.finish()
+        let trailing = try decoder.finish(truncated: false)
         #expect(trailing.isEmpty, "every envelope closed before the stream ended")
         events += trailing
         #expect(events == [.reasoning("synthetic-reasoning"), .response("synthetic-response")])

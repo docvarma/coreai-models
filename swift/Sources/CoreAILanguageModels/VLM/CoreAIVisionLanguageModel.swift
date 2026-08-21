@@ -34,12 +34,23 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
     /// The caller-supplied protocol this artifact speaks. Never inferred.
     let protocolProfile: CoreAILanguageProtocolProfile
 
-    /// `.vision` is intrinsic to the adapter; everything else comes from the
-    /// validated profile and nothing else.
+    /// `.vision` is intrinsic to the adapter. `.reasoning` follows the
+    /// validated profile, because this executor runs the shared output decoder
+    /// and really does segment reasoning out of the stream.
+    ///
+    /// `.toolCalling` is deliberately withheld even for the four profiles whose
+    /// `supportsToolCalling` is true. `CoreAIVLMExecutor.respond` never reads
+    /// `request.enabledToolDefinitions` and `buildPromptTokens` has no `tools:`
+    /// parameter, so a session attaching tools here would have them accepted
+    /// and thrown away — the same silent drop this provider exists to delete,
+    /// moved from reasoning to tools. Add `.toolCalling` to this list only in
+    /// the change that renders tool definitions into the vision prompt.
     package static func declaredCapabilities(
         for profile: CoreAILanguageProtocolProfile
     ) -> [LanguageModelCapabilities.Capability] {
-        [.vision] + profile.declaredCapabilities
+        var capabilities: [LanguageModelCapabilities.Capability] = [.vision]
+        if profile.supportsReasoning { capabilities.append(.reasoning) }
+        return capabilities
     }
 
     public var capabilities: LanguageModelCapabilities {
@@ -229,8 +240,15 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         var reasoningTokenCount = 0
         var pendingTokens: [Int] = []
         var previousText = ""
+        // Distinguishes "the model emitted an end-of-turn token" from "we ran
+        // out of budget", which decide whether an open block at the end of the
+        // stream is a protocol violation or ordinary truncation.
+        var stoppedOnStopToken = false
         for try await output in stream {
-            if stopTokens.contains(output.tokenId) { break }
+            if stopTokens.contains(output.tokenId) {
+                stoppedOnStopToken = true
+                break
+            }
             generatedCount += 1
             pendingTokens.append(Int(output.tokenId))
 
@@ -251,9 +269,10 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
             }
         }
 
-        // Drain anything held back waiting for a marker, and report an
-        // unterminated block rather than dropping it.
-        for event in try decoder.finish() {
+        // Drain anything held back waiting for a marker. An unterminated block
+        // is reported only when the model chose to stop; a capped or cancelled
+        // generation flushes its partial content instead.
+        for event in try decoder.finish(truncated: !stoppedOnStopToken) {
             if case .reasoning = event { reasoningTokenCount += 1 }
             await CoreAILanguageModel.CoreAIExecutor.dispatch(event, to: channel)
         }

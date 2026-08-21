@@ -20,7 +20,7 @@ struct EnvelopeDecoderTests {
             profile: profile, reasoningEnabled: reasoningEnabled)
         var events: [CoreAIStreamingOutputDecoder.Event] = []
         for delta in deltas { events += try decoder.consume(delta) }
-        return events + (try decoder.finish())
+        return events + (try decoder.finish(truncated: false))
     }
 
     /// Chunking decides how many `.response`/`.reasoning` events a run of text
@@ -165,7 +165,7 @@ struct EnvelopeDecoderTests {
         events += try decoder.consume(":1")
         #expect(events.isEmpty, "no fragment of the body may be dispatched")
         events += try decoder.consume("}<|call|>")
-        events += try decoder.finish()
+        events += try decoder.finish(truncated: false)
         #expect(
             events == [
                 .toolCall(

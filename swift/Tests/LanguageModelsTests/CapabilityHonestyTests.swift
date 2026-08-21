@@ -106,14 +106,21 @@ struct CapabilityHonestyTests {
         }
     }
 
-    @Test("The vision model keeps .vision and adds only what the profile declares")
+    @Test("The vision model keeps .vision and adds only what it can actually honor")
     func visionCapabilitiesFollowTheProfile() {
         for profile in CoreAILanguageProtocolProfile.allCases {
             let capabilities = LanguageModelCapabilities(
                 CoreAIVisionLanguageModel.declaredCapabilities(for: profile))
             #expect(capabilities.contains(.vision), "\(profile.rawValue) dropped .vision")
             #expect(capabilities.contains(.reasoning) == profile.supportsReasoning)
-            #expect(capabilities.contains(.toolCalling) == profile.supportsToolCalling)
+            // Four of the five profiles have supportsToolCalling == true, so
+            // this is a live assertion, not a tautology. The vision executor
+            // never reads `request.enabledToolDefinitions` and never renders
+            // them into the prompt, so advertising `.toolCalling` would accept
+            // a session's tools and silently discard them.
+            #expect(
+                !capabilities.contains(.toolCalling),
+                "\(profile.rawValue) advertised tools the vision executor cannot honor")
         }
     }
 
