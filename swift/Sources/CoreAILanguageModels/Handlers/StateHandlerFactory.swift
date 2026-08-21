@@ -26,95 +26,28 @@ struct SyncStateHandlerSet {
     var hasNonTruncatableStates: Bool
 }
 
-/// Creates state handlers from a model's function descriptor.
-///
-/// Classification priority:
-/// 1. Explicit metadata (`"states"` field in metadata.json) — preferred
-/// 2. Shape-based heuristic — dynamic dim → kvCache, static + "cache" in name → slidingCache, else → fixed
-/// 3. Legacy (2 states) — both kvCache, no warning
+/// Creates state handlers from an explicitly validated model descriptor.
 enum StateHandlerFactory {
-    /// Classify states using metadata or heuristic fallback.
-    static func classifyStates(
-        descriptor: InferenceFunctionDescriptor,
-        stateKinds: [String: StateKind]? = nil,
-        verbose: Bool = false
-    ) -> [(name: String, kind: StateKind)] {
-        let names = descriptor.stateNames
-
-        if let kinds = stateKinds {
-            // Explicit metadata — validate and use
-            return names.map { name in
-                let kind = kinds[name] ?? inferKind(name: name, descriptor: descriptor)
-                return (name, kind)
-            }
-        }
-
-        // Heuristic fallback
-        if names.count == 2 {
-            // Legacy: 2 states = both KV cache (no warning)
-            return names.map { ($0, .kvCache) }
-        }
-
-        // N states: classify by shape + name
-        let classified = names.map { name -> (String, StateKind) in
-            (name, inferKind(name: name, descriptor: descriptor))
-        }
-
-        if verbose {
-            CLILogger.log("State classification (heuristic):", component: "StateHandlerFactory")
-            for (name, kind) in classified {
-                guard case .ndArray(let desc) = descriptor.stateDescriptor(of: name) else { continue }
-                let shapeStr = desc.shape.map { $0 < 0 ? "?" : "\($0)" }.joined(separator: "×")
-                let growth = desc.shape.contains(where: { $0 < 0 }) ? "GROWING" : "FIXED"
-                CLILogger.log(
-                    "  \(name): \(growth) \(kind.rawValue) (\(shapeStr))",
-                    component: "StateHandlerFactory")
-            }
-            CLILogger.log(
-                "  Add \"states\" to metadata.json for explicit control.",
-                component: "StateHandlerFactory")
-        }
-        if !verbose && names.count > 2 {
-            CLILogger.log(
-                "StateHandlerFactory: \(names.count) states classified by heuristic. "
-                    + "Add \"states\" to metadata.json for explicit control.",
-                component: "StateHandlerFactory")
-        }
-
-        return classified
-    }
-
-    /// Infer state kind from shape and name.
-    private static func inferKind(name: String, descriptor: InferenceFunctionDescriptor) -> StateKind {
-        guard case .ndArray(let desc) = descriptor.stateDescriptor(of: name) else {
-            return .fixed
-        }
-        let hasDynamicDim = desc.shape.contains(where: { $0 < 0 })
-        if hasDynamicDim {
-            return .kvCache
-        }
-        let lower = name.lowercased()
-        if lower.contains("cache") || lower.contains("kv") {
-            return .slidingCache
-        }
-        return .fixed
-    }
-
     /// Create sync state handlers from classified states.
     static func createSyncHandlers(
         descriptor: InferenceFunctionDescriptor,
         maxContextLength: Int,
-        stateKinds: [String: StateKind]? = nil,
-        options: EngineOptions = EngineOptions(),
-        verbose: Bool = false
+        stateKinds: [String: StateKind],
+        options: EngineOptions = EngineOptions()
     ) throws -> SyncStateHandlerSet {
         guard !descriptor.stateNames.isEmpty else {
             throw InferenceRuntimeError.invalidOutputType(
                 "Expected states but found none")
         }
 
-        let classified = classifyStates(
-            descriptor: descriptor, stateKinds: stateKinds, verbose: verbose)
+        guard Set(stateKinds.keys) == Set(descriptor.stateNames) else {
+            throw InferenceRuntimeError.invalidOutputType(
+                "Validated state roles must match the graph states exactly"
+            )
+        }
+        let classified = descriptor.stateNames.map { name in
+            (name: name, kind: stateKinds[name]!)
+        }
 
         // Separate into growing (kvCache) and fixed (slidingCache + fixed)
         var growingPairs: [(name: String, descriptor: NDArrayDescriptor)] = []
@@ -141,7 +74,10 @@ enum StateHandlerFactory {
         // Build growing handler (KV caches)
         let kvCache: any SyncStateHandler
         if !growingPairs.isEmpty {
-            if options.kvCacheStrategy == .fixedSize {
+            let hasDynamicKVShape = growingPairs.contains { pair in
+                pair.descriptor.shape.contains(where: { $0 < 0 })
+            }
+            if options.kvCacheStrategy == .fixedSize || !hasDynamicKVShape {
                 let resolved = growingPairs.map { (name, desc) -> (name: String, descriptor: NDArrayDescriptor) in
                     let resolvedDesc = desc.resolvingDynamicDimensions(
                         desc.shape.map { $0 < 0 ? maxContextLength : $0 })
