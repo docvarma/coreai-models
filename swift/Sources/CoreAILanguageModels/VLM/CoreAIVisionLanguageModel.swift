@@ -34,6 +34,12 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
     /// The caller-supplied protocol this artifact speaks. Never inferred.
     let protocolProfile: CoreAILanguageProtocolProfile
 
+    /// All EOS-like token IDs beyond the tokenizer's main `eosTokenId` — e.g.
+    /// Gemma's `<end_of_turn>`, read from tokenizer_config.json at init. Read
+    /// exactly as `CoreAILanguageModel` reads it, so the two adapters stop on
+    /// the same tokens.
+    let additionalEosTokenIds: [Int32]
+
     /// `.vision` is intrinsic to the adapter. `.reasoning` follows the
     /// validated profile, because this executor runs the shared output decoder
     /// and really does segment reasoning out of the stream.
@@ -120,6 +126,15 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
         )
 
         self.protocolProfile = protocolProfile
+        // Read additional stop token IDs from tokenizer_config.json (e.g.
+        // Gemma's <end_of_turn>). Empty when the bundle has no tokenizer
+        // directory.
+        if let tokenizerDir = bundle.tokenizerPath {
+            self.additionalEosTokenIds = LanguageConfig.additionalStopTokenIds(
+                from: tokenizerDir, tokenizer: tokenizer)
+        } else {
+            self.additionalEosTokenIds = []
+        }
         self.executorConfiguration = CoreAIVLMExecutor.Configuration(
             bundleURL: url,
             engine: engine,
@@ -213,9 +228,8 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
             inputTokenCount: promptTokens.count,
             reservedOutputTokenCount: maxTokens,
             attachmentCount: images.count)
-        var stopTokens = Set<Int32>()
-        if let eos = tokenizer.eosTokenId { stopTokens.insert(Int32(eos)) }
-        if let imEnd = tokenizer.convertTokenToId("<|im_end|>") { stopTokens.insert(Int32(imEnd)) }
+        let stopTokens = Self.stopTokenIDs(
+            tokenizer: tokenizer, additionalEosTokenIds: model.additionalEosTokenIds)
 
         let stream = try await CoreAIRequestAdmission.perform(
             metrics: metrics,
@@ -229,20 +243,85 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
             )
         }
 
-        // Same decoder the text adapter uses, driven by the same validated
-        // profile, so a VLM that advertises reasoning or tool calling actually
-        // segments them out instead of leaking protocol markup as response
-        // text.
-        var decoder = CoreAIStreamingOutputDecoder(
+        let outcome = try await Self.consumeGeneration(
+            stream: stream,
+            stopTokens: stopTokens,
+            tokenizer: tokenizer,
             profile: model.protocolProfile,
-            reasoningEnabled: reasoning.enabled)
+            reasoningEnabled: reasoning.enabled
+        ) { event in
+            await CoreAILanguageModel.CoreAIExecutor.dispatch(event, to: channel)
+        }
+
+        await channel.send(
+            .response(
+                action: .updateUsage(
+                    input: .init(totalTokenCount: promptTokens.count, cachedTokenCount: 0),
+                    output: .init(
+                        totalTokenCount: outcome.generatedTokenCount,
+                        reasoningTokenCount: outcome.reasoningTokenCount)
+                )))
+    }
+
+    // MARK: - End of turn
+
+    /// Every token that ends a turn for this artifact.
+    ///
+    /// The tokenizer's own `eosTokenId` plus the artifact's declared extra
+    /// stop tokens, exactly as `CoreAILanguageModel`'s text path unions them.
+    /// There is deliberately no hardcoded spelling here: a literal such as
+    /// `<|im_end|>` is a model-family guess, and a bundle whose family ends
+    /// turns some other way (Gemma's `<end_of_turn>`) would run past its own
+    /// end of turn and stream both the raw marker and a fabricated next turn
+    /// to the caller as response text.
+    package static func stopTokenIDs(
+        tokenizer: any Tokenizer,
+        additionalEosTokenIds: [Int32]
+    ) -> Set<Int32> {
+        var stopTokens = Set<Int32>()
+        if let eos = tokenizer.eosTokenId { stopTokens.insert(Int32(eos)) }
+        stopTokens.formUnion(additionalEosTokenIds)
+        return stopTokens
+    }
+
+    /// What one consumed generation stream produced, beyond the events already
+    /// handed to `emit`.
+    package struct GenerationOutcome: Equatable, Sendable {
+        package var generatedTokenCount: Int
+        package var reasoningTokenCount: Int
+        /// True when the model emitted an end-of-turn token. Distinguishes
+        /// "the model ended its turn" from "we ran out of budget", which
+        /// decide whether an open block at the end of the stream is a protocol
+        /// violation or ordinary truncation.
+        package var stoppedOnStopToken: Bool
+    }
+
+    /// Drives one token stream through the shared streaming decoder.
+    ///
+    /// Split out of `respond` so the end-of-turn contract is exercisable
+    /// without a model: the stop-token check, the incremental detokenizer and
+    /// the truncation decision handed to `finish` all live here, and a test
+    /// drives them with a synthetic token sequence.
+    ///
+    /// The decoder is the same one the text adapter uses, driven by the same
+    /// validated profile, so a VLM that advertises reasoning or tool calling
+    /// actually segments them out instead of leaking protocol markup as
+    /// response text.
+    package static func consumeGeneration<Stream: AsyncSequence>(
+        stream: Stream,
+        stopTokens: Set<Int32>,
+        tokenizer: any Tokenizer,
+        profile: CoreAILanguageProtocolProfile,
+        reasoningEnabled: Bool,
+        emit: (CoreAIStreamingOutputDecoder.Event) async -> Void
+    ) async throws -> GenerationOutcome where Stream.Element == InferenceOutput {
+        var decoder = CoreAIStreamingOutputDecoder(
+            profile: profile,
+            reasoningEnabled: reasoningEnabled)
         var generatedCount = 0
         var reasoningTokenCount = 0
         var pendingTokens: [Int] = []
         var previousText = ""
-        // Distinguishes "the model emitted an end-of-turn token" from "we ran
-        // out of budget", which decide whether an open block at the end of the
-        // stream is a protocol violation or ordinary truncation.
         var stoppedOnStopToken = false
         for try await output in stream {
             if stopTokens.contains(output.tokenId) {
@@ -261,7 +340,7 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
             let delta = String(decoded.dropFirst(common.count))
             for event in try decoder.consume(delta) {
                 if case .reasoning = event { reasoningTokenCount += 1 }
-                await CoreAILanguageModel.CoreAIExecutor.dispatch(event, to: channel)
+                await emit(event)
             }
             if let last = pendingTokens.last {
                 pendingTokens = [last]
@@ -274,17 +353,13 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         // generation flushes its partial content instead.
         for event in try decoder.finish(truncated: !stoppedOnStopToken) {
             if case .reasoning = event { reasoningTokenCount += 1 }
-            await CoreAILanguageModel.CoreAIExecutor.dispatch(event, to: channel)
+            await emit(event)
         }
 
-        await channel.send(
-            .response(
-                action: .updateUsage(
-                    input: .init(totalTokenCount: promptTokens.count, cachedTokenCount: 0),
-                    output: .init(
-                        totalTokenCount: generatedCount,
-                        reasoningTokenCount: reasoningTokenCount)
-                )))
+        return GenerationOutcome(
+            generatedTokenCount: generatedCount,
+            reasoningTokenCount: reasoningTokenCount,
+            stoppedOnStopToken: stoppedOnStopToken)
     }
 
     // MARK: - Prompt Construction
