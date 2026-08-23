@@ -67,7 +67,8 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
             prepared: ConstrainedDecodedSequence.Prepared(
                 session: consume session,
                 inputTokens: inputTokens,
-                maxTokens: maxTokens
+                maxTokens: maxTokens,
+                stopReasonStore: StopReasonStore()
             ),
             tokenizer: tokenizer,
             inferenceEngine: inferenceEngine,
@@ -220,6 +221,8 @@ extension ConstrainedDecodingStrategy {
         let samplingConfiguration: SamplingConfiguration
         let stopSequences: StopSequences
 
+        public var stopReason: StopReason? { prepared.stopReasonStore.stopReason }
+
         public func makeAsyncIterator() -> Iterator {
             Iterator(
                 prepared: prepared,
@@ -232,21 +235,27 @@ extension ConstrainedDecodingStrategy {
     }
 }
 
+extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence:
+    StopReasonReportingGenerationSequence {}
+
 extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
     /// Holds the eagerly-created, move-only generation session together with the tokenized prompt and token budget.
     fileprivate final class Prepared {
         var session: ConstrainedGenerationSession?
         let inputTokens: [Int32]
         let maxTokens: Int
+        let stopReasonStore: StopReasonStore
 
         init(
             session: consuming ConstrainedGenerationSession,
             inputTokens: [Int32],
-            maxTokens: Int
+            maxTokens: Int,
+            stopReasonStore: StopReasonStore
         ) {
             self.session = consume session
             self.inputTokens = inputTokens
             self.maxTokens = maxTokens
+            self.stopReasonStore = stopReasonStore
         }
     }
 }
@@ -260,6 +269,7 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
         private let inferenceEngine: any InferenceEngine
         private let samplingConfiguration: SamplingConfiguration
         private let stopSequences: StopSequences
+        private let stopReasonStore: StopReasonStore
         private let constrainedOptions = InferenceOptions(maxTokens: 1, includeLogits: true)
 
         // Generation state, seeded eagerly from the prepared setup.
@@ -282,6 +292,7 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
             self.session = prepared.session.take()
             self.inputTokens = prepared.inputTokens
             self.maxTokens = prepared.maxTokens
+            self.stopReasonStore = prepared.stopReasonStore
             self.tokenizer = tokenizer
             self.inferenceEngine = inferenceEngine
             self.samplingConfiguration = samplingConfiguration
@@ -302,6 +313,7 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
                 }
                 if session.isTerminated {
                     finished = true
+                    stopReasonStore.setIfUnset(.eos)
                     return nil
                 }
 
@@ -317,6 +329,11 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
                     )
                 } catch {
                     finished = true
+                    if error is CancellationError {
+                        stopReasonStore.set(.cancelled)
+                    } else {
+                        stopReasonStore.set(.error)
+                    }
                     // Drop session — generation failed, no further use.
                     throw error
                 }
@@ -326,22 +343,19 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
 
                 guard let bestToken = result.0, let logits = result.1 else {
                     finished = true
+                    stopReasonStore.set(.error)
                     return nil
                 }
 
                 if stopSequences.matches(recentTokens: [bestToken]) {
                     finished = true
+                    stopReasonStore.set(.eos)
                     return nil
                 }
 
                 inputTokens.append(bestToken)
                 generatedTokens.append(bestToken)
                 tokenStep += 1
-
-                if terminatedAfterAccept {
-                    finished = true
-                    return nil
-                }
 
                 let delta = ConstrainedDecodingStrategy.computeTextDelta(
                     generatedTokens: generatedTokens,
@@ -350,10 +364,16 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
                     tokenStep: tokenStep
                 )
 
+                if terminatedAfterAccept {
+                    finished = true
+                    stopReasonStore.set(.eos)
+                }
+
                 return GenerationResult(text: delta, tokenId: bestToken, rawLogits: logits)
             }
 
             finished = true
+            stopReasonStore.setIfUnset(.maxTokens)
             return nil
         }
     }

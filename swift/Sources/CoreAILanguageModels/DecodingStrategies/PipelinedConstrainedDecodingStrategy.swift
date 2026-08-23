@@ -107,6 +107,9 @@ public struct PipelinedConstrainedSequence: AsyncSequence {
     let engine: any ConstrainedGenerationCapable
     let samplingConfiguration: SamplingConfiguration
     let stopSequences: StopSequences
+    private let stopReasonStore = StopReasonStore()
+
+    public var stopReason: StopReason? { stopReasonStore.stopReason }
 
     /// Guards against multiple `makeAsyncIterator()` calls sharing the same session box.
     private let consumed = SingleUseFlag()
@@ -121,10 +124,13 @@ public struct PipelinedConstrainedSequence: AsyncSequence {
             tokenizer: tokenizer,
             engine: engine,
             samplingConfiguration: samplingConfiguration,
-            stopSequences: stopSequences
+            stopSequences: stopSequences,
+            stopReasonStore: stopReasonStore
         )
     }
 }
+
+extension PipelinedConstrainedSequence: StopReasonReportingGenerationSequence {}
 
 extension PipelinedConstrainedSequence {
     public final class Iterator: AsyncIteratorProtocol {
@@ -136,11 +142,13 @@ extension PipelinedConstrainedSequence {
         private let samplingConfiguration: SamplingConfiguration
         private let stopSequences: StopSequences
         private let session: ConstrainedSessionHandle
+        private let stopReasonStore: StopReasonStore
 
         private let inputTokens: [Int32]
         private let maxTokens: Int
 
         private var innerIterator: AsyncThrowingStream<Int32, Error>.AsyncIterator?
+        private var innerStream: InferenceTokenSequence?
         private var generatedTokens: [Int32] = []
         private var previousDecodedText: String = ""
         private var recentTokens: [Int32] = []
@@ -153,7 +161,8 @@ extension PipelinedConstrainedSequence {
             tokenizer: any Tokenizer,
             engine: any ConstrainedGenerationCapable,
             samplingConfiguration: SamplingConfiguration,
-            stopSequences: StopSequences
+            stopSequences: StopSequences,
+            stopReasonStore: StopReasonStore
         ) {
             self.session = session
             self.inputTokens = inputTokens
@@ -162,6 +171,7 @@ extension PipelinedConstrainedSequence {
             self.engine = engine
             self.samplingConfiguration = samplingConfiguration
             self.stopSequences = stopSequences
+            self.stopReasonStore = stopReasonStore
         }
 
         public func next() async throws -> GenerationResult? {
@@ -175,6 +185,7 @@ extension PipelinedConstrainedSequence {
                     maxTokens: maxTokens,
                     session: session
                 )
+                self.innerStream = stream
                 self.innerIterator = stream.makeAsyncIterator()
             }
 
@@ -187,12 +198,14 @@ extension PipelinedConstrainedSequence {
                     // reference type, so the copy shares the underlying stream state.
                     guard var iterator = self.innerIterator else {
                         finished = true
+                        stopReasonStore.setIfUnset(.error)
                         return nil
                     }
 
                     guard let tokenId = try await iterator.next() else {
                         finished = true
                         self.innerIterator = nil
+                        stopReasonStore.setIfUnset(innerStream?.stopReason ?? .maxTokens)
                         return nil
                     }
                     self.innerIterator = iterator
@@ -204,6 +217,8 @@ extension PipelinedConstrainedSequence {
                     }
                     if stopSequences.matches(recentTokens: recentTokens) {
                         finished = true
+                        innerStream?.setStopReason(.eos)
+                        stopReasonStore.set(.eos)
                         self.innerIterator = nil
                         return nil
                     }
@@ -234,6 +249,11 @@ extension PipelinedConstrainedSequence {
             } catch {
                 finished = true
                 self.innerIterator = nil
+                if error is CancellationError {
+                    stopReasonStore.set(.cancelled)
+                } else {
+                    stopReasonStore.set(.error)
+                }
                 throw error
             }
         }

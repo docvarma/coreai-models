@@ -50,6 +50,7 @@ public struct MockTokenizer: Tokenizer, Sendable {
     public var eosTokenId: Int? { 2 }
     public var unknownToken: String? { "<unk>" }
     public var unknownTokenId: Int? { 0 }
+    public var hasChatTemplate: Bool { true }
 
     public func encode(text: String) -> [Int] {
         Array(text.utf8).map { Int($0) }

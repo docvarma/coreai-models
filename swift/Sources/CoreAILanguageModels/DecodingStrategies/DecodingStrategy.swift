@@ -22,6 +22,11 @@ public struct GenerationResult: Sendable {
     }
 }
 
+protocol StopReasonReportingGenerationSequence: AsyncSequence
+where Element == GenerationResult, Failure == Error {
+    var stopReason: StopReason? { get }
+}
+
 // MARK: - Stop Sequences
 
 /// Represents a collection of stop token sequences for halting text generation

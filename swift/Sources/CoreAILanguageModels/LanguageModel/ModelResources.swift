@@ -23,6 +23,7 @@ final class ModelResources: ResourceManaging {
 
     private let state = Mutex(State())
     private let loader: @Sendable () async throws -> any InferenceEngine
+    private let generationGate = PipelineGate(capacity: 1)
 
     /// Production initializer: loads via `CoreAIRunner` from the configuration.
     init(configuration: CoreAILanguageModel.CoreAIExecutor.Configuration) {
@@ -49,6 +50,8 @@ final class ModelResources: ResourceManaging {
             return loaded is any ConstrainedGenerationCapable
         }
     }
+
+    var _generationWaitersForTesting: Int { generationGate._waitersForTesting }
 
     /// Returns the engine, loading it on first use. Concurrent callers share one
     /// load; later callers get the warmed engine instantly.
@@ -88,6 +91,9 @@ final class ModelResources: ResourceManaging {
     func withEngine<T>(
         _ body: (any InferenceEngine) async throws -> T
     ) async throws -> T {
+        await generationGate.acquire()
+        defer { generationGate.release() }
+        try Task.checkCancellation()
         let engine = try await engine()
         state.withLock { $0.activeBorrows += 1 }
         defer {

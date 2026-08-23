@@ -34,6 +34,7 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
     private(set) var storeSessionCallCount = 0
     private(set) var generateCallCount = 0
     private(set) var lastSchemaUsed: String?
+    private var stopTokenIDs = Set<Int32>()
 
     /// The cached session handle (simulating the real cache)
     private var cached: ConstrainedSessionHandle?
@@ -73,6 +74,7 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
     ) throws -> ConstrainedSessionHandle {
         getSessionCallCount += 1
         lastSchemaUsed = jsonSchema
+        stopTokenIDs = Set(stopTokenIds ?? [])
 
         if let handle = cached, handle.schema == jsonSchema {
             cached = nil
@@ -105,11 +107,29 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
 
         let task = Task {
             defer { self.storeConstrainedSessionForReuse(session) }
-            for i in 0..<limit {
-                do { try Task.checkCancellation() } catch { break }
-                if !session.acceptToken(tokens[i]) { break }
-                if session.isTerminated { break }
-                continuation.yield(tokens[i])
+            do {
+                for i in 0..<limit {
+                    try Task.checkCancellation()
+                    if stopTokenIDs.contains(tokens[i]) {
+                        continuation.yield(tokens[i])
+                        stopReasonStore.set(.eos)
+                        break
+                    }
+                    guard session.acceptToken(tokens[i]) else {
+                        stopReasonStore.set(.error)
+                        break
+                    }
+                    continuation.yield(tokens[i])
+                    if session.isTerminated {
+                        stopReasonStore.set(.eos)
+                        break
+                    }
+                }
+                stopReasonStore.setIfUnset(session.isTerminated ? .eos : .maxTokens)
+            } catch is CancellationError {
+                stopReasonStore.set(.cancelled)
+            } catch {
+                stopReasonStore.set(.error)
             }
             continuation.finish()
         }
@@ -253,6 +273,30 @@ struct PipelinedConstrainedIntegrationTests {
         for try await _ in stream { count += 1 }
 
         #expect(count <= 1)
+        #expect(stream.stopReason == .maxTokens)
+    }
+
+    @Test("Grammar completion reports EOS and preserves its closing token")
+    func grammarCompletionReportsEOS() async throws {
+        let engine = MockConstrainedEngine(scriptedTokens: [123, 125, 2])
+        let strategy = PipelinedConstrainedDecodingStrategy(
+            jsonSchema: #"{"type":"object","properties":{},"additionalProperties":false}"#,
+            vocabSize: 256
+        )
+        let stream = try await strategy.decode(
+            from: .tokens([1]),
+            tokenizer: tokenizer,
+            inferenceEngine: engine,
+            samplingConfiguration: .greedy,
+            options: InferenceOptions(maxTokens: 3),
+            stopSequences: StopSequences(sequences: [[2]])
+        )
+
+        var text = ""
+        for try await result in stream { text += result.text }
+
+        #expect(text == "{}")
+        #expect(stream.stopReason == .eos)
     }
 
     @Test("Stop sequence terminates generation")

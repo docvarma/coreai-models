@@ -300,10 +300,19 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                     isCancelled: isCancelled,
                     yieldingTo: continuation
                 )
+                if isCancelled.load(ordering: .relaxed) {
+                    stopReasonStore.set(.cancelled)
+                } else if session.isTerminated {
+                    stopReasonStore.set(.eos)
+                } else {
+                    stopReasonStore.setIfUnset(.maxTokens)
+                }
                 continuation.finish()
             } catch is CancellationError {
+                stopReasonStore.set(.cancelled)
                 continuation.finish()
             } catch {
+                stopReasonStore.set(.error)
                 continuation.finish(throwing: error)
             }
         }
@@ -1263,8 +1272,14 @@ private struct EngineImpl: ~Copyable {
 
             // Check for jump-forward: deterministic grammar segments that can be
             // batch-encoded without per-token sampling (saves N-1 round-trips)
-            if let jumpString = session.findJumpForwardString(),
-                let jumpTokens = tokenizeJumpForward(jumpString, session: session)
+            let remainingTokenBudget = maxTokens - generated
+            if remainingTokenBudget > 1,
+                let jumpString = session.findJumpForwardString(),
+                let jumpTokens = tokenizeJumpForward(
+                    jumpString,
+                    maximumTokenCount: remainingTokenBudget - 1,
+                    session: session
+                )
             {
                 // Batch-encode jump-forward tokens + sample next token after them
                 let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
@@ -1350,6 +1365,7 @@ private struct EngineImpl: ~Copyable {
     /// back any partially-accepted tokens to restore grammar state.
     private func tokenizeJumpForward(
         _ string: String,
+        maximumTokenCount: Int,
         session: ConstrainedSessionHandle
     ) -> [Int32]? {
         let tokenIds = session.tokenizeForJumpForward(string)
@@ -1372,7 +1388,8 @@ private struct EngineImpl: ~Copyable {
         }
         guard safeCount > 0, safeCount <= Self.maxJumpForwardTokens else { return nil }
 
-        let safeTokens = Array(tokenIds.prefix(safeCount))
+        let safeTokens = Array(tokenIds.prefix(min(safeCount, maximumTokenCount)))
+        guard !safeTokens.isEmpty else { return nil }
 
         // Accept each safe token one-at-a-time; rollback on rejection.
         var accepted = 0

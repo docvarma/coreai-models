@@ -131,4 +131,31 @@ struct ModelResourcesTests {
         try await borrow
         #expect(resources.isLoaded == false)
     }
+
+    @Test("Concurrent generations borrow the engine exclusively")
+    func concurrentGenerationsAreSerialized() async throws {
+        let resources = ModelResources { MockEngine() }
+        let firstEntered = Atomic(false)
+        let releaseFirst = Atomic(false)
+        let secondEntered = Atomic(false)
+
+        async let first: Void = resources.withEngine { _ in
+            firstEntered.store(true, ordering: .relaxed)
+            while !releaseFirst.load(ordering: .relaxed) { await Task.yield() }
+        }
+        while !firstEntered.load(ordering: .relaxed) { await Task.yield() }
+
+        async let second: Void = resources.withEngine { _ in
+            secondEntered.store(true, ordering: .relaxed)
+        }
+        try await PipelineGateTests.waitUntil { resources._generationWaitersForTesting == 1 }
+        let enteredBeforeRelease = secondEntered.load(ordering: .relaxed)
+        #expect(!enteredBeforeRelease)
+
+        releaseFirst.store(true, ordering: .relaxed)
+        try await first
+        try await second
+        let enteredAfterRelease = secondEntered.load(ordering: .relaxed)
+        #expect(enteredAfterRelease)
+    }
 }

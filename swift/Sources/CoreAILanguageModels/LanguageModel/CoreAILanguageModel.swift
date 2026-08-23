@@ -9,6 +9,18 @@ import FoundationModels
 import Synchronization
 import Tokenizers
 
+enum CoreAIRequestRouting: Equatable, Sendable {
+    case protocolGeneration
+    case constrainedGeneration
+
+    static func select(hasSchema: Bool, enabledToolCount: Int) -> Self {
+        if enabledToolCount > 0 || !hasSchema {
+            return .protocolGeneration
+        }
+        return .constrainedGeneration
+    }
+}
+
 /// FoundationModels Adoption for Core AI inference engines.
 ///
 /// Wraps any `InferenceEngine` (pipelined, sequential, or static-shape) and exposes it
@@ -217,19 +229,17 @@ public struct CoreAILanguageModel: LanguageModel {
 
         // MARK: - Properties
 
-        private let resources: ModelResources
-
         // MARK: - Initialization
 
         public init(configuration: Configuration) throws {
-            self.resources = ModelResources.shared(for: configuration)
+            _ = configuration
         }
 
         // MARK: - Prewarm (FoundationModels, synchronous)
 
         /// Kicks off the engine load in the background.
         public func prewarm(model: CoreAILanguageModel, transcript: Transcript) {
-            Task { try? await resources.loadResources() }
+            Task { try? await model.resources.loadResources() }
         }
 
         // MARK: - respond(to:model:streamingInto:) — new channel-based API
@@ -275,12 +285,18 @@ public struct CoreAILanguageModel: LanguageModel {
                 attachmentCount: Self.attachmentCount(in: request.transcript))
 
             // Borrow the engine for the whole generation.
-            try await resources.withEngine { engine in
+            try await model.resources.withEngine { engine in
                 // FoundationModels now threads entry identity itself based on event
                 // ordering — we no longer mint an entryID and pass it down.
 
-                // Check if guided generation is requested
-                if let schema = request.schema {
+                switch CoreAIRequestRouting.select(
+                    hasSchema: request.schema != nil,
+                    enabledToolCount: request.enabledToolDefinitions.count
+                ) {
+                case .constrainedGeneration:
+                    guard let schema = request.schema else {
+                        preconditionFailure("Constrained routing requires a response schema")
+                    }
                     guard engine.supportsLogits || engine is any ConstrainedGenerationCapable else {
                         throw LanguageModelError.unsupportedCapability(
                             .init(
@@ -302,7 +318,7 @@ public struct CoreAILanguageModel: LanguageModel {
                         admission: model.requestAdmission,
                         channel: channel
                     )
-                } else {
+                case .protocolGeneration:
                     try await respondVanilla(
                         engine: engine,
                         model: model,
@@ -446,7 +462,8 @@ public struct CoreAILanguageModel: LanguageModel {
                         output: .init(
                             totalTokenCount: generatedTokenCount,
                             reasoningTokenCount: reasoningTokenCount
-                        )
+                        ),
+                        metadata: Self.terminalMetadata(for: tokenStream.stopReason)
                     )))
 
             // Yield to let the engine's tokenSequence Task finish cleanup
@@ -465,6 +482,12 @@ public struct CoreAILanguageModel: LanguageModel {
         /// an ordinary short generation into a hard failure.
         static func isTruncated(_ stopReason: StopReason?) -> Bool {
             stopReason != .eos
+        }
+
+        private static func terminalMetadata(
+            for stopReason: StopReason?
+        ) -> [String: any ConvertibleToGeneratedContent] {
+            isTruncated(stopReason) ? ["incompleteOutput": true] : [:]
         }
 
         // MARK: - Event Dispatch
@@ -533,40 +556,46 @@ public struct CoreAILanguageModel: LanguageModel {
                 preconditionFailure("GenerationSchema JSON encoding produced invalid UTF-8")
             }
 
-            let strategy: any DecodingStrategy
-            if engine is any ConstrainedGenerationCapable {
-                strategy = PipelinedConstrainedDecodingStrategy(
-                    jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize)
-            } else {
-                strategy = ConstrainedDecodingStrategy(
-                    jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize)
-            }
             let stopSequences = StopSequences(
                 for: model.tokenizer,
                 additionalEosTokenIds: model.additionalEosTokenIds
             )
 
-            let stream = try await CoreAIRequestAdmission.perform(
-                metrics: metrics,
-                admission: admission
-            ) {
-                try await strategy.decode(
-                    from: .tokens(promptTokens),
-                    tokenizer: model.tokenizer,
-                    inferenceEngine: engine,
-                    samplingConfiguration: samplingConfig,
-                    options: InferenceOptions(maxTokens: maxTokens),
-                    stopSequences: stopSequences
-                )
-            }
-
-            // Bridge AsyncThrowingStream -> LanguageModelExecutorGenerationChannel
-            var generatedTokenCount = 0
-            for try await result in stream {
-                generatedTokenCount += 1
-                await channel.send(
-                    .response(action: .appendText(result.text, tokenCount: 1))
-                )
+            let outcome: (generatedTokenCount: Int, stopReason: StopReason?)
+            if engine is any ConstrainedGenerationCapable {
+                let strategy = PipelinedConstrainedDecodingStrategy(
+                    jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize)
+                let stream = try await CoreAIRequestAdmission.perform(
+                    metrics: metrics,
+                    admission: admission
+                ) {
+                    try await strategy.decode(
+                        from: .tokens(promptTokens),
+                        tokenizer: model.tokenizer,
+                        inferenceEngine: engine,
+                        samplingConfiguration: samplingConfig,
+                        options: InferenceOptions(maxTokens: maxTokens),
+                        stopSequences: stopSequences
+                    )
+                }
+                outcome = try await Self.forwardConstrained(stream, to: channel)
+            } else {
+                let strategy = ConstrainedDecodingStrategy(
+                    jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize)
+                let stream = try await CoreAIRequestAdmission.perform(
+                    metrics: metrics,
+                    admission: admission
+                ) {
+                    try await strategy.decode(
+                        from: .tokens(promptTokens),
+                        tokenizer: model.tokenizer,
+                        inferenceEngine: engine,
+                        samplingConfiguration: samplingConfig,
+                        options: InferenceOptions(maxTokens: maxTokens),
+                        stopSequences: stopSequences
+                    )
+                }
+                outcome = try await Self.forwardConstrained(stream, to: channel)
             }
 
             await channel.send(
@@ -574,14 +603,30 @@ public struct CoreAILanguageModel: LanguageModel {
                     action: .updateUsage(
                         input: .init(totalTokenCount: promptTokens.count, cachedTokenCount: 0),
                         output: .init(
-                            totalTokenCount: generatedTokenCount,
+                            totalTokenCount: outcome.generatedTokenCount,
                             reasoningTokenCount: 0
-                        )
+                        ),
+                        metadata: Self.terminalMetadata(for: outcome.stopReason)
                     )))
 
             // Yield to let the engine's tokenSequence Task finish cleanup
             // (putBackEngine, state reset, etc.) before the next respond().
             await Task.yield()
+        }
+
+        private static func forwardConstrained<Sequence>(
+            _ stream: Sequence,
+            to channel: LanguageModelExecutorGenerationChannel
+        ) async throws -> (generatedTokenCount: Int, stopReason: StopReason?)
+        where Sequence: StopReasonReportingGenerationSequence {
+            var generatedTokenCount = 0
+            for try await result in stream {
+                generatedTokenCount += 1
+                await channel.send(
+                    .response(action: .appendText(result.text, tokenCount: 1))
+                )
+            }
+            return (generatedTokenCount, stream.stopReason)
         }
 
         // MARK: - Transcript inspection
